@@ -1,7 +1,8 @@
 # 02 — Requirements Trace
 
-Each row: the requirement from `docs/02-software-requirements-specification.md`
-(SRS), where it's implemented, which automated test proves it, and the result.
+Each row: the requirement from `trust-orchestrator-final-report.md` §3
+(authoritative requirements), where it's implemented, which automated test
+proves it, and the result.
 
 ## Functional requirements (FR)
 

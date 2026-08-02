@@ -35,8 +35,7 @@ A judge-friendly one-paragraph version:
 ## Canonical sources (outside this folder)
 
 - `trust-orchestrator-final-report.md` — the formal acceptance report
-- `docs/02-software-requirements-specification.md` — the SRS this folder traces
-- `docs/03-test-plan.md` — the test plan this folder's test inventory mirrors
+- `README.md` (root) — quick start, layout, ceremony commands
 - `reports/audit-round-2.md` — the live audit that produced these numbers
 - `reports/benchmark.json` — 10 scenario rows, regenerable via `make bench`
 - `reports/kill-tests.log` — the fault-injection run
