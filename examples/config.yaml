@@ -1,0 +1,6 @@
+# Deployment guide §6: flat-key subset of the node config.
+node: W1
+role: watchdog
+peers: [W2, W3, W4, W5]
+detector: rate_cusum
+interval: 30s
