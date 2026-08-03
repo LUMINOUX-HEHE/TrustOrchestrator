@@ -8,10 +8,13 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	to "trustorchestrator"
 )
@@ -55,6 +58,8 @@ func main() {
 		err = policyReload(tl, args)
 	case "rollback":
 		err = rollbackDryRun(tl, args)
+	case "serve":
+		err = serve(args)
 	default:
 		usage()
 	}
@@ -71,7 +76,8 @@ func usage() {
   to-orchestrator verify --root <hash> [--events <file>]
   to-orchestrator graph --identity <fingerprint> [--events <file>]
   to-orchestrator policy reload --policy <policy.json> [--events <file>]
-  to-orchestrator rollback --dry-run [--to <checkpoint-hash>] [--events <file>]`)
+  to-orchestrator rollback --dry-run [--to <checkpoint-hash>] [--events <file>]
+  to-orchestrator serve --listen <addr> --ca <ca.der> --cert <leaf.der> --key <key.hex>`)
 	os.Exit(1)
 }
 
@@ -336,4 +342,81 @@ func rollbackDryRun(tl *to.Timeline, args []string) error {
 	}
 	fmt.Printf("  state: %d certs pre-compromise -> %d certs compromised\n", len(pre.Certs), len(post.Certs))
 	return nil
+}
+
+// serve runs the live fleet with relay: binds an mTLS listener and prints
+// each ensemble verdict. Watchdogs stream per-cycle scores into it.
+func serve(args []string) error {
+	listen, caPath, certPath, keyPath := "", "", "", ""
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--listen":
+			if i+1 < len(args) {
+				listen = args[i+1]
+				i++
+			}
+		case "--ca":
+			if i+1 < len(args) {
+				caPath = args[i+1]
+				i++
+			}
+		case "--cert":
+			if i+1 < len(args) {
+				certPath = args[i+1]
+				i++
+			}
+		case "--key":
+			if i+1 < len(args) {
+				keyPath = args[i+1]
+				i++
+			}
+		}
+	}
+	if listen == "" || caPath == "" || certPath == "" || keyPath == "" {
+		return errors.New("usage: serve --listen <addr> --ca <ca.der> --cert <leaf.der> --key <key.hex>")
+	}
+	caDER, err := os.ReadFile(caPath)
+	if err != nil {
+		return err
+	}
+	leafDER, err := os.ReadFile(certPath)
+	if err != nil {
+		return err
+	}
+	keyRaw, err := os.ReadFile(keyPath)
+	if err != nil {
+		return err
+	}
+	seed, err := hex.DecodeString(string(keyRaw))
+	if err != nil {
+		return err
+	}
+	tlsCfg, err := to.MutualTLSConfig(caDER, leafDER, ed25519.PrivateKey(seed))
+	if err != nil {
+		return err
+	}
+	ln, err := tls.Listen("tcp", listen, tlsCfg)
+	if err != nil {
+		return err
+	}
+	fleet := to.NewFleet(25.0, 3, 5*30*time.Second)
+	verds := fleet.Subscribe()
+	fmt.Printf("orchestrator listening on %s (mTLS, TLS 1.3)\n", listen)
+	go func() {
+		for v := range verds {
+			status := "healthy"
+			if v.Detected {
+				status = "DETECTED"
+			}
+			// count contributing nodes
+			names := make([]string, 0, len(v.Scores))
+			for _, s := range v.Scores {
+				names = append(names, s.NodeID)
+			}
+			fmt.Printf("ENSEMBLE: %s (contributing=%d/%d nodes %v)\n", status, v.Count, v.Total, names)
+		}
+	}()
+	err = fleet.Serve(ln)
+	ln.Close()
+	return err
 }

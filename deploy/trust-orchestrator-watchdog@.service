@@ -1,0 +1,28 @@
+[Unit]
+Description=Trust Orchestrator — watchdog %i (live stream to orchestrator)
+Requires=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# One event stream per invocation (guide §12); a long-running daemon would
+# use Type=simple with --tail -1. Identify each node via --node-id=W%i.
+ExecStart=/usr/local/bin/to-watchdog run \
+  --events /srv/inputs/evidence.json \
+  --params /etc/trust-orchestrator/params.json \
+  --node-id %i \
+  --live {orchestrator_addr} \
+  --ca /etc/trust-orchestrator/ca.der \
+  --cert /etc/trust-orchestrator/w%i.der \
+  --key  /etc/trust-orchestrator/w%i.key \
+  --server-name orchestrator
+Restart=on-failure
+RestartSec=30
+User=trust-orch
+
+[Install]
+WantedBy=multi-user.target
+
+# Enable once per node with the instance slot:
+#   systemctl enable --now trust-orchestrator-watchdog@W1.service
+#   (the S1 burst demo: %i = W1, W2, W3 on the same host)

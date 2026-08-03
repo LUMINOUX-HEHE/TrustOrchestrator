@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -78,7 +80,8 @@ func usage() {
   to-tool bench [run] [--out <dir>] [--scenario all] [--log <file>]
   to-tool bench calibrate [--baseline-traffic <file>]
   to-watchdog enroll --bootstrap <keyfile> --node-id W1 [--role watchdog] [--config <f>]
-  to-watchdog run --events <file> [--kind <detector>] [--params <params.json>] [--tail <n>]`)
+  to-watchdog run --events <file> [--kind <detector>] [--params <params.json>] [--tail <n>] [--node-id W1] [--live <addr> --ca <ca.der> --cert <leaf.der> --key <key.hex> --server-name <SAN>]
+  to-watchdog run --events <file> --probe-cmd <shell-cmd>   # W4 external probe: each cycle runs <cmd>; exit 0 -> score 100, non-zero -> score 0`)
 	os.Exit(1)
 }
 
@@ -421,12 +424,13 @@ func calibrate(args []string) error {
 	return nil
 }
 
-// watchdogRun replays a timeline one event per 30s cycle and prints the
-// watchdog's per-cycle scores — the single-node view of what the deployment
-// daemon would gossip. Parameters come from params.json (FR2.5: calibration
-// output, never hand-set).
+// watchdogRun replays a timeline one event per 30s cycle and prints (or, with
+// --live, streams to a live orchestrator) the watchdog's per-cycle scores.
+// The single-node view of what the deployment daemon would gossip; parameters
+// come from params.json (FR2.5: calibration output, never hand-set).
 func watchdogRun(args []string) error {
 	eventsFile, paramsFile, kind := "", "", "rate_cusum"
+	live, caPath, certPath, keyPath, nodeID, serverName, probeCmd := "", "", "", "", "", "", ""
 	tail := -1
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -450,10 +454,45 @@ func watchdogRun(args []string) error {
 				fmt.Sscanf(args[i+1], "%d", &tail)
 				i++
 			}
+		case "--live":
+			if i+1 < len(args) {
+				live = args[i+1] // orchestrator listen address
+				i++
+			}
+		case "--node-id":
+			if i+1 < len(args) {
+				nodeID = args[i+1]
+				i++
+			}
+		case "--ca":
+			if i+1 < len(args) {
+				caPath = args[i+1]
+				i++
+			}
+		case "--cert":
+			if i+1 < len(args) {
+				certPath = args[i+1]
+				i++
+			}
+		case "--key":
+			if i+1 < len(args) {
+				keyPath = args[i+1]
+				i++
+			}
+		case "--server-name":
+			if i+1 < len(args) {
+				serverName = args[i+1]
+				i++
+			}
+		case "--probe-cmd":
+			if i+1 < len(args) {
+				probeCmd = args[i+1]
+				i++
+			}
 		}
 	}
 	if eventsFile == "" {
-		return errors.New("usage: run --events <file> [--kind <detector>] [--params <params.json>]")
+		return errors.New("usage: run --events <file> [--kind <detector>] [--params <params.json>] [--live <orch-addr> --ca <ca.der> --cert <leaf.der> --key <key.hex>] [--probe-cmd <shell-cmd>]")
 	}
 	tl, err := loadTimelineOrEvidence(eventsFile)
 	if err != nil {
@@ -499,9 +538,14 @@ func watchdogRun(args []string) error {
 		log.Mirror(e)
 	}
 	w := to.NewWatchdog("W1", kind, mu0, delta, h, tl, log)
+	if nodeID != "" {
+		w.ID = nodeID
+	}
+	if live != "" {
+		return streamLive(w, live, caPath, certPath, keyPath, serverName, probeCmd, evs)
+	}
 	for i, e := range evs {
-		w.ObserveBatch([]to.TrustEvent{e}, i)
-		s := w.Score()
+		s := cycleScore(w, i, e, probeCmd)
 		alarm := "ok"
 		if s.Score < 100 {
 			alarm = fmt.Sprintf("ALARM (evidence: %s)", s.Evidence)
@@ -509,6 +553,75 @@ func watchdogRun(args []string) error {
 		fmt.Printf("cycle %d: %s score %.0f %s\n", i, s.NodeID, s.Score, alarm)
 	}
 	return nil
+}
+
+// cycleScore observes one cycle and returns the watchdog score, unless
+// --probe-cmd is set: then the W4 external-probe verdict replaces the
+// detector score (exit 0 -> healthy 100, non-zero -> alarm 0).
+func cycleScore(w *to.Watchdog, i int, e to.TrustEvent, probeCmd string) to.Score {
+	w.ObserveBatch([]to.TrustEvent{e}, i)
+	s := w.Score()
+	if probeCmd == "" {
+		return s
+	}
+	if err := runProbe(probeCmd); err != nil {
+		return to.Score{NodeID: s.NodeID, Score: 0, PValue: 0.01,
+			Evidence: []byte("probe failed: " + err.Error())}
+	}
+	return to.Score{NodeID: s.NodeID, Score: 100, PValue: 1.0}
+}
+
+// runProbe runs the external probe with a 10s cap; non-zero exit is a probe
+// failure (service down, answer absent). to-dnsprobe exits non-zero on any
+// query error, so `--probe-cmd "to-dnsprobe --server 8.8.8.8:53 --name
+// example.com --type A"` is the canonical W4 wiring (guide §12).
+func runProbe(cmd string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, "sh", "-c", cmd).Run()
+}
+
+// streamLive dials the fleet server and pushes each cycle's score over mTLS
+// — the real watchdog process writing into the relay (guide §5 §12).
+func streamLive(w *to.Watchdog, live, caPath, certPath, keyPath, serverName, probeCmd string, evs []to.TrustEvent) error {
+	caDER, err := os.ReadFile(caPath)
+	if err != nil {
+		return err
+	}
+	leafDER, err := os.ReadFile(certPath)
+	if err != nil {
+		return err
+	}
+	seed, err := hex.DecodeString(string(mustFile(keyPath)))
+	if err != nil {
+		return err
+	}
+	cfg, err := to.MutualTLSConfig(caDER, leafDER, ed25519.PrivateKey(seed))
+	if err != nil {
+		return err
+	}
+	// dialing by address (127.0.0.1) requires ServerName to match the
+	// orchestrator's server-cert name, not the caller's own identity.
+	if serverName != "" {
+		cfg.ServerName = serverName
+	}
+	peer := to.NewFleetPeer(live, cfg)
+	defer peer.Close()
+	for i, e := range evs {
+		s := cycleScore(w, i, e, probeCmd)
+		if err := peer.Send(s); err != nil {
+			fmt.Fprintf(os.Stderr, "cycle %d: send failed: %v (reconnecting next cycle)\n", i, err)
+		}
+	}
+	return nil
+}
+
+func mustFile(path string) []byte {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		panic(err) // flags were validated upstream; a missing key is a hard stop
+	}
+	return b
 }
 
 // loadTimelineOrEvidence reads a timeline dump or a benchmark evidence

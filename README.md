@@ -1,66 +1,125 @@
 # Trust Orchestrator
 
-Self-hosted PKI trust management with autonomous compromise detection,
-council-mediated recovery, and verified time-travel rollback. Design and
-requirements live in `docs/` (overview, architecture, requirements, threat
-model, cryptography, workflow, testing, deployment, limitations) and
-`trust-orchestrator-final-report.md`.
+A self-hosted PKI trust-management engine: it **detects its own compromise**,
+**recovers via a majority-vote cryptographic council**, and **rolls back to a
+verified checkpoint** — re-issuing only the damaged certificates, with every step proved by
+tests, a formal model, and a benchmark.
 
-## Layout
+This repository is the **engine**, not the airframe: threshold crypto, the
+chain-of-custody timeline, the watchdog ensemble, quorum detection, rollback
+math, and the CLIs that run them are real (Ed25519, SHA-256, Shamir secret
+sharing, TLS 1.3 — stdlib only, zero third-party dependencies). The
+"deployment layer" — a five-machine network, real VPN/DNS/eBPF filters,
+hardware enclave — is documented in `docs/09-limitations.md`, not faked here.
 
-- `*.go` — core library (timeline, watchdogs, council, rollback, auditors, consumers, identity)
-- `cmd/to/` — CLI: bootstrap key generation, sharding, enrollment, benchmark, or watchdog (to-tool/to-bench/to-watchdog share one CLI)
-- `cmd/orchestrator/`, `cmd/council/`, `cmd/auditor/` — daily-operation binaries (guide §7, §9)
-- `cmd/identity/`, `cmd/pdp/` — consumer binaries: workload-cert issuer and policy reference (guide §3)
-- `specs/` — TLA+ model, TLC model-check configuration, P2/P6 mutation tests
-- `docs/` — self-contained documentation set (00 overview … 09 limitations)
+## The problem in one line
+
+Certificates spread through trust edges; when one is stolen, *revoking
+everything* takes you offline and *revoking too little* leaves the front door
+open. This system decides exactly what to roll back and re-issue, without a
+single machine deciding anything alone.
+
+- **Detect:** 5 independent watchdogs score every 30s cycle; DETECTED iff
+  ≥3/5 fall below the calibrated threshold (P2: one compromised watchdog can
+  neither trigger nor block).
+- **Recover:** a 5-node council holding Shamir shards of a backup root key —
+  ≥3 votes reconstruct the key, roll back to the last verified checkpoint,
+  and re-issue only the damaged identities (minimal blast radius, P5).
+- **Prove:** the timeline is an append-only signed hash chain; every rollback
+  is a verified fork; recovery post-conditions are checked (P3: a revoked cert
+  is never resurrected).
+
+| P# | Invariant | Proof |
+|---|---|---|
+| P1 | A cert is never valid under two canonical anchors at once (fork safety) | TLA+ + `TestForkRaceRejected` |
+| P2 | One compromised watchdog can neither trigger nor block detection | `Detect(≥3/5)` + `TestInsiderCan'tTrigger` |
+| P3 | Rollback never resurrects a revoked certificate | `TestFoldNoResurrection` |
+| P4 | Detection converges on a single canonical timeline | `TestEpochCommitValidity` |
+| P5 | Corrupted followers never win / minimal blast radius | mutation of P6, TLC violation + `InvalidationSet` |
+| P6 | Only the council can execute recovery; auditors never can | council-only key |
+
+## Repository layout
+
+- `*.go` — core library: `timeline.go`/`graph.go` (trust chain), `watchdogs.go`
+  /`detect.go`/`ensemble.go` (ensemble), `audit.go` (transparency), `council.go`
+  /`shamir.go` (threshold recovery), `rollback.go`/`consumer.go` (time travel),
+  `fleet.go`/`transport.go`/`mtls.go` (the mTLS wire), `identity.go` (real
+  X.509), `bench.go` (TrustOps)
+- `cmd/to/` — one CLI, three personalities (to-tool / to-bench / to-watchdog by
+  basename): genkey, shard, enroll, revoke, bench, watchdog run
+- `cmd/orchestrator/`, `cmd/council/`, `cmd/auditor/` — daily-operation binaries
+- `cmd/identity/`, `cmd/pdp/` — consumers: workload-cert issuer + policy check
+- `cmd/dnsprobe/` — the W4 external-probe helper
+- `specs/` — TLA+ model, TLC configs, P2/P6 mutation tests
+- `docs/00-overview.md` … `docs/09-limitations.md` — self-contained reference
+  (overview, architecture, requirements trace, component map, threat model,
+  cryptography, workflow, testing, deployment, honest limitations)
+- `deploy/` — systemd units + `fleet-smoke.sh` live-fleet proof
 - `tools/` — tla2tools.jar pinned for the model check
-- `examples/` — policy + config samples
-- `scratch/` — generated artifacts (keys, shards, binaries, coverage); git-ignored, never pushed
+- `reports/` — regenerable evidence: benchmark, calibration, params, TLC log,
+  kill-test log, canonical/evidence dumps
+- `trust-orchestrator-final-report.md` — the full acceptance report
+
+## Requirements
+
+- **Go 1.22+** (no third-party deps; Windows/Linux/macOS)
+- **Java 21+** — only for `make model-check` / `make model-check-mutations`
+- **bash** — only for `make fleet-smoke`
 
 ## Quick start
 
 ```bash
-make test                  # unit + scenario tests (all green)
+make test                  # 51 unit + scenario tests, all green
 make benchmark             # TrustOps S1–S7 + baseline + calibration
 make model-check           # TLC on specs/ (requires Java 21+), writes reports/tlc.log
 make model-check-mutations # P2/P6 mutation tests — TLC must report a violation
-make kill-tests            # kill-test (chaos) suite, writes reports/kill-tests.log
-make build                 # to-tool, to-bench, to-watchdog, to-orchestrator, to-council, to-auditor, to-identity, to-pdp
+make kill-tests            # K1–K6 fault injection (chaos) suite → reports/kill-tests.log
+make fleet-smoke           # live fleet: 4 processes, real mTLS, healthy + DETECTED verdicts
+make build                 # 9 binaries; make build-linux → static linux/amd64 ELFs
 ```
 
-Bootstrap + enrollment ceremony (offline machine / per node):
+Bootstrap + enrollment ceremony (one-time, offline / per node):
 
 ```bash
 go run ./cmd/to genkey bootstrap.key
 go run ./cmd/to shard --key bootstrap.key --shares 5 --threshold 3   # 5 shard files
 go run ./cmd/to enroll --bootstrap bootstrap.key --config config.yaml
-go run ./cmd/to enroll --bootstrap bootstrap.key --node-id W1        # guide §5 short form
+go run ./cmd/to enroll --bootstrap bootstrap.key --node-id W1        # short form
+go run ./cmd/to revoke --bootstrap bootstrap.key                    # FR8.2: spent after genesis
 ```
 
-TrustOps benchmark (S1–S7 + baseline + calibration):
+TrustOps adversary (S1–S7 + baseline + calibration):
 
-```bash
+```sh
 go run ./cmd/to bench run --scenario all --out reports --log reports/action-log.txt
 go run ./cmd/to bench calibrate --out reports
-# -> reports/benchmark.json, reports/calibration.json (ROC sweep),
-#    reports/params.json (detector parameters, FR2.5), reports/action-log.txt,
-#    reports/evidence.json (recovery evidence)
+# -> reports/benchmark.json, reports/calibration.json, reports/params.json,
+#    reports/action-log.txt, reports/evidence.json
 ```
 
-Manual recovery drill (guide §9), after an attack:
+| Scenario | Attack | Correct behaviour |
+|---|---|---|
+| S1 burst | cert flood from compromised issuer | DETECTED, correct rollback, no false positive |
+| S2 slow poison | gradual cheating over HOURS, below every rate bound | DETECTED-only if auditors escalate; measured gap |
+| S3 insider | legitimate (non-alarmed) cert, one watchdog only | NOT detected — correct |
+| S4 partition | network partition | detect, no false alarm |
+| S5 fork race | malicious competing fork | unique canonical; fork rejected |
+| S6 combined | burst + partition simultaneously | DETECTED, rollback correct |
+| S7 omniscient | attacker knowing the thresholds | measured detection gap, not an alarm |
 
-```bash
+Manual recovery drill (after an attack):
+
+```sh
 go run ./cmd/council recover --evidence reports/evidence.json \
     --shards shard-1.json shard-2.json shard-3.json --out reports
 # -> RECOVER/RECONSTRUCT/RE-ISSUE/COMMIT/VERIFY report; canonical.json
 ```
 
-Daily operation (guide §7):
+Daily operation:
 
-```bash
+```sh
 go run ./cmd/orchestrator status --events reports/canonical.json
-go run ./cmd/orchestrator rollback --dry-run --events reports/evidence.json   # guide §9 invalidation set
+go run ./cmd/orchestrator rollback --dry-run --events reports/evidence.json
 go run ./cmd/orchestrator policy reload --policy policy.json --events reports/canonical.json
 go run ./cmd/orchestrator timeline --tail 20 --events reports/canonical.json
 go run ./cmd/orchestrator verify --root <hash> --events reports/canonical.json
@@ -68,31 +127,48 @@ go run ./cmd/orchestrator graph --identity user --events reports/canonical.json
 go run ./cmd/auditor audit --log reports/canonical.json --policy policy.json
 ```
 
-Consumers (guide §3): workload-cert issuer + policy reference
+Consumers: workload-cert issuer + policy reference
 
-```bash
-go run ./cmd/identity ca --key <recovered-root.key>                     # mint the identity CA
-go run ./cmd/identity issue --ca ca.der --key ca.key --identity server  # issue a workload cert
+```sh
+go run ./cmd/identity ca --key <recovered-root.key>                     # identity CA
+go run ./cmd/identity issue --ca ca.der --key ca.key --identity server  # mint a workload cert
 go run ./cmd/identity verify --cert leaf.der --ca ca.der
 go run ./cmd/pdp check --policy policy.json --events reports/canonical.json
 ```
 
+Watchdog replay (`--live` streams over real mTLS to an orchestrator; start with
+`make fleet-smoke` for a 4-process demo):
+
+```sh
+go run ./cmd/to watchdog run --events reports/evidence.json \
+    --kind behavior_baseline --params reports/params.json --tail 10
+go run ./cmd/to watchdog run --events reports/evidence.json \
+    --probe-cmd "go run ./cmd/dnsprobe --server 8.8.8.8:53 --name example.com"
+```
+
 Formal model check (requires Java 21+):
 
-```bash
-cd specs
-java -jar ../tools/tla2tools.jar -workers 12 -config TrustOrchestrator.cfg TrustOrchestrator.tla
+```sh
+cd specs && java -jar ../tools/tla2tools.jar -workers 12 \
+    -config TrustOrchestrator.cfg TrustOrchestrator.tla
 # -> "Model checking completed. No error has been found." (P1/P2/P3/P4/P6)
 ```
 
-## Notes
+## How claims are backed
 
-- The core runs scenarios in-process with simulated 30s cycles; the network
-  surface (gossip transport, config daemons, systemd units, the VPN/DNS/eBPF
-  consumer daemons and SGX enclave) is the documented deployment layer — its
-  transport is verified as a real mutual-TLS handshake over issued workload
-  certs (`TestMutualTLSRequest`).
-- Every published number is produced by `make benchmark` with the parameters
-  pinned in `bench.go` (single set for all scenarios).
-- P5 (minimal blast) is a graph-level property verified in Go
-  (`InvalidationSet` + `VerifyRecovery`); the TLA model covers P1/P2/P3/P4/P6.
+- Every published number comes from `make benchmark` with parameters pinned in
+  `bench.go` (one set for all scenarios); `reports/` contains the generated
+  evidence and `reports/audit-round-2.md` the audit that produced them.
+- Formal properties P1–P6 are layered: TLA+ model check, Go invariant tests,
+  and a cross-checking council.
+- P5 (minimal blast) is asserted in Go (`InvalidationSet` + `VerifyRecovery`); the
+  TLA model covers P1/P2/P3/P4/P6.
+- The network surface is exercised live, not just code-reviewed: `make
+  fleet-smoke` runs four real processes over mTLS and asserts both a healthy
+  and a DETECTED verdict (`fleet.go` + `TestMutualTLSRequest`).
+
+## Full report
+
+For the deep-dive — problem motivation, related work, formal specification,
+protocol details, and evaluation — read `trust-orchestrator-final-report.md`,
+then follow the index in `docs/README.md`.

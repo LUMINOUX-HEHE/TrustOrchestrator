@@ -530,9 +530,7 @@ func (b *Bench) ScenarioVerifyScaling() Metrics {
 		return best
 	}
 	tSmall := best(small.Verify)
-	start := time.Now()
-	large.Verify()
-	tLarge := time.Since(start)
+	tLarge := best(large.Verify)
 	m.VerifyEvents = 100_000
 	m.VerifyTime = tLarge
 	m.VerifyPerEvent = tLarge / 100_000

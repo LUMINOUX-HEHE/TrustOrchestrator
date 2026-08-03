@@ -1,0 +1,22 @@
+[Unit]
+Description=Trust Orchestrator — live ensemble verdict (guide §12)
+Requires=network-online.target
+After=network-online.target
+
+[Service]
+# Unit = the listener identity (to-identity issue --key-out), see 08-deployment.md §5
+ExecStart=/usr/local/bin/to-orchestrator serve \
+  --listen {listen_addr} \
+  --ca /etc/trust-orchestrator/ca.der \
+  --cert /etc/trust-orchestrator/orch.der \
+  --key  /etc/trust-orchestrator/orch.key
+Restart=on-failure
+RestartSec=5
+User=trust-orch
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

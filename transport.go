@@ -13,9 +13,8 @@ import (
 // Wire: the fleet transport (FR2.2 loopback → real sockets). Each watchdog
 // dials the orchestrator and streams (score, p, evidence) frames as
 // length-prefixed JSON over mutual TLS.
-// ponytail: orchestrators accept one peer at a time (sequential Accept);
-// concurrent fan-in is per-host socket work, not protocol semantics — add
-// a goroutine per Accept when a second machine joins the fleet.
+// Monitors/fan-in: FleetServer (fleet.go) serves all peers concurrently —
+// the historical "sequential Accept" limit is lifted there.
 type WireMsg struct {
 	NodeID   string   `json:"node_id"`
 	Score    float64  `json:"score"`

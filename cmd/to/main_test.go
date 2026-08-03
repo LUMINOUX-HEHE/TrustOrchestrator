@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -128,5 +129,20 @@ func TestBootstrapRevokedAfterGenesis(t *testing.T) {
 	// A node that tries to enroll with the now-spent key must be refused.
 	if err := enroll([]string{"--bootstrap", bootstrapPath, "--node-id", "W2", "--role", "watchdog"}); err == nil {
 		t.Fatal("second enroll succeeded with a revoked bootstrap — FR8.2 violated")
+	}
+}
+
+// TestRunProbeExitCode: the W4 external-probe mapping — exit 0 is a healthy
+// cycle, any non-zero exit is an alarm. Dies if the mapping drifts (the
+// fleet would silently score a dead service as healthy).
+func TestRunProbeExitCode(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh in PATH")
+	}
+	if err := runProbe("exit 0"); err != nil {
+		t.Fatalf("exit 0 must be a healthy cycle, got %v", err)
+	}
+	if err := runProbe("exit 3"); err == nil {
+		t.Fatal("non-zero exit must alarm")
 	}
 }

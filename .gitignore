@@ -12,6 +12,7 @@ bin/
 reports/
 coverage.out
 scratch/
+*.exe
 
 # TLC state files
 states/

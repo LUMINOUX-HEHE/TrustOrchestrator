@@ -74,3 +74,22 @@ ENSEMBLE: healthy            EPOCH: 1    ANCHOR: b6776b0b…28f429
 ```
 
 The anchor is the SHA-256 root of the canonical timeline — anyone can audit it.
+## Linux: ports, units, real DNS consumer
+
+```
+make build-linux   # 9 static linux/amd64 ELFs into bin/linux (works from any host)
+```
+
+The fleet runs as real processes: `to-orchestrator serve` (systemd unit in
+`deploy/trust-orchestrator.service`) + `to-watchdog run --live` (unit
+`deploy/trust-orchestrator-watchdog@.service`), mTLS via
+`deploy/`-documented to-identity leaf issuance.
+
+`to-dnsprobe` is the real DNS consumer (D2 went from docs-only to shipped):
+a live UDP DNS query for TXT/A and a wire decoder, returning the answer set
+the workloads see:
+
+```
+to-dnsprobe --server 8.8.8.8:53 --name example.com --type A
++ 93.184.216.34
+```

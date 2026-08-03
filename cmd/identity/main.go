@@ -41,7 +41,7 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   to-identity ca --key <recovered-root.key> [--name <cn>] [--out ca.der]
-  to-identity issue --ca <ca.der> --key <ca.key> --identity <name> [--serial N] [--ttl 10m] [--out leaf.der]
+  to-identity issue --ca <ca.der> --key <ca.key> --identity <name> [--serial N] [--ttl 10m] [--out leaf.der] [--key-out leaf.key]
   to-identity verify --cert <leaf.der> --ca <ca.der>`)
 	os.Exit(1)
 }
@@ -141,6 +141,14 @@ func issue(args []string) error {
 	}
 	if err := os.WriteFile(out, leaf, 0o644); err != nil {
 		return err
+	}
+	// The node's private key belongs with the leaf (mTLS handshake); without
+	// it the cert is unwieldable. genkey-format hex, 0600.
+	if keyOut := f["key-out"]; keyOut != "" {
+		if err := os.WriteFile(keyOut, []byte(hex.EncodeToString(subjKey)), 0o600); err != nil {
+			return err
+		}
+		fmt.Printf("  leaf key -> %s (0600)\n", keyOut)
 	}
 	fmt.Printf("issued %s (serial %d, ttl %s) -> %s\n", f["identity"], serial, ttl, out)
 	return nil
