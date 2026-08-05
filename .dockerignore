@@ -1,0 +1,9 @@
+.git
+bin
+reports
+states
+scratch
+testdata
+docs
+*.md
+Makefile

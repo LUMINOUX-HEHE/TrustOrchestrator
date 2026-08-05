@@ -27,6 +27,9 @@ func NewCouncil(members []*CouncilMember) *Council { return &Council{members: me
 func (c *Council) Pubs() map[string]ed25519.PublicKey {
 	pubs := map[string]ed25519.PublicKey{}
 	for _, m := range c.members {
+		if m.Key == nil {
+			continue // dead member: no key, no vote
+		}
 		pubs[m.ID] = m.Key.Public().(ed25519.PublicKey)
 	}
 	return pubs
@@ -43,12 +46,18 @@ type EpochCommit struct {
 }
 
 func (ec *EpochCommit) descriptor() []byte {
+	return epochDescriptor(ec.Epoch, ec.RootHash, ec.Prev, ec.Payload)
+}
+
+// epochDescriptor is the canonical signed bytes of a commit descriptor —
+// members sign exactly this on the wire (councilnet.go).
+func epochDescriptor(epoch int64, root []byte, prev int64, payload []byte) []byte {
 	b, _ := json.Marshal(struct {
 		Epoch    int64  `json:"epoch"`
 		RootHash []byte `json:"root_hash"`
 		Prev     int64  `json:"prev"`
 		Payload  []byte `json:"payload"`
-	}{ec.Epoch, ec.RootHash, ec.Prev, ec.Payload})
+	}{epoch, root, prev, payload})
 	return b
 }
 
@@ -73,6 +82,9 @@ func (c *Council) SignCommit(epoch int64, root []byte, prev int64, payload []byt
 	}
 	ec := &EpochCommit{Epoch: epoch, RootHash: root, Prev: prev, Payload: payload, Sigs: map[string][]byte{}}
 	for _, m := range c.members {
+		if m.Key == nil {
+			continue // dead member: nothing to sign with; Valid still needs min
+		}
 		for _, id := range ids {
 			if m.ID == id {
 				ec.Sigs[m.ID] = ed25519.Sign(m.Key, ec.descriptor())
@@ -123,21 +135,17 @@ type RecoveryReport struct {
 // Recover runs the recovery state machine (architecture §6.3) for a
 // DETECTED event: verify evidence -> vote -> reconstruct root key -> roll
 // back -> re-issue -> COMMIT -> verify. Blocks (returns error) when fewer
-// than minVotes members are available (P2, NFR2.1).
+// than minVotes members are available (P2, NFR2.1). The networked variant
+// (councilnet.go, RemoteRecover) shares the same tail via finishRecovery.
 func (c *Council) Recover(tl *Timeline, evidence *TrustEvent, minVotes int) (*RecoveryReport, error) {
-	if evidence == nil || evidence.Type != EvDetected {
-		return nil, errors.New("council: evidence is not a DETECTED event")
-	}
-	var ev struct {
-		BadIndex int `json:"bad_index"`
-	}
-	if json.Unmarshal(evidence.Payload, &ev) != nil || ev.BadIndex < 0 {
-		return nil, errors.New("council: malformed evidence payload")
+	badIdx, err := evidenceBadIndex(evidence)
+	if err != nil {
+		return nil, err
 	}
 	// VERIFY_EVIDENCE: each member independently re-checks the chain up to
 	// the first bad event — the compromised region beyond it is what we are
 	// rolling back from.
-	if !tl.VerifyPrefix(ev.BadIndex) {
+	if !tl.VerifyPrefix(badIdx) {
 		return nil, errors.New("council: prefix failed verification")
 	}
 	// VOTE: all reachable members vote RECOVER.
@@ -148,36 +156,75 @@ func (c *Council) Recover(tl *Timeline, evidence *TrustEvent, minVotes int) (*Re
 	for _, m := range c.members {
 		ids = append(ids, m.ID)
 	}
-	// RECONSTRUCT: >=3 shards -> root key, memory only, zeroized after use.
-	shards := make([]*Shard, 0, 3)
-	for _, m := range c.members[:3] {
-		shards = append(shards, m.Shard)
-	}
-	root, err := ShamirJoin(shards)
+	// RECONSTRUCT: minVotes shards from any available members -> root key,
+	// memory only, zeroized after use. Shards come from the members present,
+	// not from a hardcoded prefix (K3: recovery continues after a kill).
+	shards, err := collectShards(c.members, minVotes)
 	if err != nil {
-		return nil, fmt.Errorf("council: reconstruction failed: %w", err)
+		return nil, err
 	}
-	defer zeroize(root)
-	// RE_ISSUE: root signs a fresh intermediate CA; intermediate issues the
-	// scoped re-issuance batch.
+	return finishRecovery(c, tl, badIdx, shards, minVotes, ids)
+}
+
+// evidenceBadIndex parses the DETECTED evidence payload (shared by the
+// in-process and networked recovery paths).
+func evidenceBadIndex(evidence *TrustEvent) (int, error) {
+	if evidence == nil || evidence.Type != EvDetected {
+		return -1, errors.New("council: evidence is not a DETECTED event")
+	}
+	var ev struct {
+		BadIndex int `json:"bad_index"`
+	}
+	if json.Unmarshal(evidence.Payload, &ev) != nil || ev.BadIndex < 0 {
+		return -1, errors.New("council: malformed evidence payload")
+	}
+	return ev.BadIndex, nil
+}
+
+// collectShards takes minVotes shards from available members (P2: fewer
+// blocks; K3: a dead member is skipped, not fatal).
+func collectShards(members []*CouncilMember, minVotes int) ([]*Shard, error) {
+	shards := make([]*Shard, 0, minVotes)
+	for _, m := range members {
+		if m.Shard == nil {
+			continue
+		}
+		shards = append(shards, m.Shard)
+		if len(shards) == minVotes {
+			break
+		}
+	}
+	if len(shards) < minVotes {
+		return nil, errors.New("BLOCKED: fewer than minVotes shards available")
+	}
+	return shards, nil
+}
+
+// recoverFork is the shared recovery middle: reconstruct the root key,
+// roll back at the checkpoint, re-issue scoped to the affected identities,
+// revoke the compromised certs on the fork. The fork is keyed by the
+// reconstructed root (memory only, zeroized by the caller's deferred
+// zeroize), not by the timeline's original key.
+func recoverFork(tl *Timeline, badIdx int, root []byte, epoch int64) (*Timeline, map[string]bool, map[string]bool, []byte, []string, error) {
+	rootKey := ed25519.NewKeyFromSeed(root)
 	inter, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, nil, nil, err
 	}
-	rootKey := ed25519.NewKeyFromSeed(root)
-	interCert := ed25519.Sign(rootKey, inter)
-	// ROLLBACK: fork at last verified good entry, re-fold, scoped re-issue.
-	fork, err := Rollback(tl, ev.BadIndex)
+	interCert := ed25519.Sign(rootKey, inter) // root signs a fresh intermediate CA
+	fork, err := Rollback(tl, badIdx)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, nil, nil, err
 	}
-	affected, identities := InvalidationSet(tl, ev.BadIndex)
+	fork.key = rootKey
+	fork.pub = rootKey.Public().(ed25519.PublicKey)
+	affected, identities := InvalidationSet(tl, badIdx)
 	var issued []string
 	for id := range identities {
-		newID := id + "-re" + strconv.FormatInt(c.epoch+1, 10)
+		newID := id + "-re" + strconv.FormatInt(epoch+1, 10)
 		pl, _ := json.Marshal(issuePayload{CertID: newID, Identity: id})
 		if _, err := fork.Append(EvIssue, pl, 0); err != nil {
-			return nil, err
+			return nil, nil, nil, nil, nil, err
 		}
 		issued = append(issued, newID)
 	}
@@ -187,13 +234,28 @@ func (c *Council) Recover(tl *Timeline, evidence *TrustEvent, minVotes int) (*Re
 		}{cid})
 		fork.Append(EvRevoke, pl, 0) // revoke compromised certs on the fork
 	}
+	return fork, affected, identities, interCert, issued, nil
+}
+
+// finishRecovery is the shared recovery tail: reconstruct -> roll back ->
+// re-issue -> COMMIT -> verify (used by Recover and RemoteRecover).
+func finishRecovery(c *Council, tl *Timeline, badIdx int, shards []*Shard, minVotes int, ids []string) (*RecoveryReport, error) {
+	root, err := ShamirJoin(shards)
+	if err != nil {
+		return nil, fmt.Errorf("council: reconstruction failed: %w", err)
+	}
+	defer zeroize(root)
+	fork, affected, identities, interCert, issued, err := recoverFork(tl, badIdx, root, c.epoch)
+	if err != nil {
+		return nil, err
+	}
 	// COMMIT: threshold-signed, monotonic epoch.
 	commit, ok := c.SignCommit(c.epoch+1, fork.Head(), c.epoch, interCert, minVotes, ids...)
 	if !ok {
 		return nil, errors.New("council: commit failed")
 	}
 	// VERIFY: invariant checks, cross-checked by >=2 members re-executing.
-	pre, _ := Rollback(tl, ev.BadIndex)
+	pre, _ := Rollback(tl, badIdx)
 	preState := pre.Fold() // pre-compromise state
 	r1 := VerifyRecovery(preState, fork.Fold(), affected, identities)
 	r2 := VerifyRecovery(preState, fork.Fold(), affected, identities)

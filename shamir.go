@@ -4,24 +4,34 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 )
 
-// p = 2^256 - 189, a standard large prime; every 32-byte seed is < p, so
-// the secret round-trips losslessly (2^255-19 would truncate top-bit seeds).
+// p = 2^256 - 189, a standard large prime. Shamir over GF(p) needs the
+// secret < p: every ed25519 seed qualifies except the 189 values of 2^256
+// in [2^256-189, 2^256-1] (probability 2^-247), which are rejected below
+// rather than silently shared wrong.
 var p = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(189))
 
-// Shard is one (x, f(x)) point of the Shamir polynomial (FR4.1).
+// Shard is one (x, f(x)) point of the Shamir polynomial (FR4.1). Len is the
+// original secret length: big.Int round-trips strip leading zero bytes, and
+// Join must pad back to it (a seed 0x00.. is a valid ed25519 seed).
 type Shard struct {
-	X *big.Int `json:"x"`
-	Y *big.Int `json:"y"`
+	X   *big.Int `json:"x"`
+	Y   *big.Int `json:"y"`
+	Len int      `json:"len,omitempty"`
 }
 
 // ShamirSplit splits secret into n shards; any k reconstruct it (3-of-5 in
-// the council). Polynomial over GF(2^255-19), stdlib big.Int only.
+// the council). Polynomial over GF(2^256-189), stdlib big.Int only.
 func ShamirSplit(secret []byte, n, k int) ([]*Shard, error) {
 	if k > n || k < 1 {
 		return nil, errors.New("shamir: need 1 <= k <= n")
+	}
+	s := new(big.Int).SetBytes(secret)
+	if s.Cmp(p) >= 0 {
+		return nil, fmt.Errorf("shamir: secret must be < 2^256-189 (got %d bytes)", len(secret))
 	}
 	coeff := make([]*big.Int, k-1)
 	for i := range coeff {
@@ -31,10 +41,9 @@ func ShamirSplit(secret []byte, n, k int) ([]*Shard, error) {
 		}
 		coeff[i] = c
 	}
-	s := new(big.Int).SetBytes(secret)
 	shards := make([]*Shard, n)
 	for x := 1; x <= n; x++ {
-		shards[x-1] = &Shard{X: big.NewInt(int64(x)), Y: evalPoly(coeff, s, big.NewInt(int64(x)))}
+		shards[x-1] = &Shard{X: big.NewInt(int64(x)), Y: evalPoly(coeff, s, big.NewInt(int64(x))), Len: len(secret)}
 	}
 	return shards, nil
 }
@@ -88,7 +97,13 @@ func ShamirJoin(pts []*Shard) ([]byte, error) {
 		secret.Add(secret, term)
 		secret.Mod(secret, p)
 	}
-	return secret.Bytes(), nil
+	b := secret.Bytes()
+	if n := pts[0].Len; n > len(b) { // restore leading zeros stripped by big.Int
+		pad := make([]byte, n)
+		copy(pad[n-len(b):], b)
+		b = pad
+	}
+	return b, nil
 }
 
 func (s *Shard) Marshal() ([]byte, error) { return json.Marshal(s) }

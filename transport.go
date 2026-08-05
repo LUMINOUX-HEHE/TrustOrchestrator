@@ -44,6 +44,25 @@ func WriteWire(conn net.Conn, msg WireMsg) error {
 	return err
 }
 
+// ParseWireFrame decodes one length-prefixed JSON frame from (header,
+// payload), enforcing the 1 MiB frame cap. This is the wire trust boundary:
+// attacker-controlled bytes must never panic the decoder.
+func ParseWireFrame(hdr, payload []byte) (WireMsg, error) {
+	if len(hdr) != 4 {
+		return WireMsg{}, errors.New("wire: bad header")
+	}
+	if n := binary.BigEndian.Uint32(hdr); n > 1<<20 {
+		return WireMsg{}, errors.New("wire: frame too large")
+	} else if uint32(len(payload)) != n {
+		return WireMsg{}, errors.New("wire: length mismatch")
+	}
+	var m WireMsg
+	if err := json.Unmarshal(payload, &m); err != nil {
+		return WireMsg{}, err
+	}
+	return m, nil
+}
+
 // ServeWire reads frames from one accepted mTLS peer into handler.
 func ServeWire(conn net.Conn, handler func(WireMsg) error) error {
 	defer conn.Close()
@@ -64,8 +83,8 @@ func ServeWire(conn net.Conn, handler func(WireMsg) error) error {
 		if _, err := io.ReadFull(r, buf); err != nil {
 			return err
 		}
-		var m WireMsg
-		if err := json.Unmarshal(buf, &m); err != nil {
+		m, err := ParseWireFrame(hdr[:], buf)
+		if err != nil {
 			return err
 		}
 		if err := handler(m); err != nil {

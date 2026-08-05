@@ -122,7 +122,7 @@ func status(tl *to.Timeline) error {
 		log.Mirror(e)
 	}
 	wd := []*to.Watchdog{
-		to.NewWatchdog("W1", to.WDIssuanceRate, 1, 1, 8, tl, log),
+		to.NewWatchdog("W1", to.WDIssuanceRate, 1, 1, to.DefaultH1(), tl, log),
 		to.NewWatchdog("W2", to.WDLogIntegrity, 0, 0, 0, tl, log),
 		to.NewWatchdog("W3", to.WDGraphAnomaly, 0.5, 0.5, 3, tl, log),
 		to.NewWatchdog("W4", to.WDExternalProbe, 0, 0, 0, tl, log),

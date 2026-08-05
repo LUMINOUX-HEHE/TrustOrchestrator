@@ -1,0 +1,276 @@
+# Trust Orchestrator on Kubernetes (deployment guide §12).
+# Bootstrap ceremony BEFORE applying (all files live in Secrets/ConfigMaps,
+# nothing is hardcoded):
+#   1. offline:  to-tool genkey root.key && to-tool shard --key root.key --shares 5 --threshold 3
+#   2. CA + node certs:  to-identity ca --key root.key --out ca.der
+#      to-identity issue --ca ca.der --key root.key --identity <C1..C5|orchestrator|watchdog> --serial N --out <node>.der --key-out <node>.key
+#   3. export timeline for watchdogs:  to-orchestrator timeline > timeline.json
+#   4. kubectl create secret ... (commands per Secret below), kubectl create configmap
+# Apply order: this file, then secrets, then configmaps, then deployments.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: trust-orchestrator
+---
+# --- Identity CA material (steps 1-2 above) ---
+# kubectl create secret generic identity-ca -n trust-orchestrator \
+#   --from-file=ca.der=ca.der --from-file=ca.key=root.key
+apiVersion: v1
+kind: Secret
+metadata:
+  name: identity-ca
+  namespace: trust-orchestrator
+type: Opaque
+stringData:
+  ca.key: "REPLACE_WITH_BOOTSTRAP_CA_KEY_HEX"
+  ca.der: "REPLACE_WITH_BOOTSTRAP_CA_DER_BASE64"
+---
+# One Secret per council member (shard + node identity). The member's shard
+# file and leaf cert never leave this Secret.
+# kubectl create secret generic council-node-1 -n trust-orchestrator \
+#   --from-file=shard.json=shard-1.json --from-file=leaf.der=C1.der --from-file=node.key=C1.key
+apiVersion: v1
+kind: Secret
+metadata:
+  name: council-node-1
+  namespace: trust-orchestrator
+type: Opaque
+stringData:
+  shard.json: "REPLACE_WITH_BOOTSTRAP_SHARD_JSON"
+  node.key: "REPLACE_WITH_NODE_KEY_HEX"
+  leaf.der: "REPLACE_WITH_NODE_LEAF_BASE64"
+---
+# ... replicate council-node-1 for council-node-2..5 (one shard + leaf + key each)
+---
+# Orchestrator node identity (CN "orchestrator").
+# kubectl create secret generic orchestrator-node -n trust-orchestrator \
+#   --from-file=leaf.der=orch.der --from-file=node.key=orch.key
+apiVersion: v1
+kind: Secret
+metadata:
+  name: orchestrator-node
+  namespace: trust-orchestrator
+type: Opaque
+stringData:
+  node.key: "REPLACE_WITH_NODE_KEY_HEX"
+  leaf.der: "REPLACE_WITH_NODE_LEAF_BASE64"
+---
+# Watchdog identity, shared by all replicas (CN "watchdog"; the fleet server
+# authenticates at TLS level, per-pod identity comes from the pod name).
+# kubectl create secret generic watchdog-node -n trust-orchestrator \
+#   --from-file=leaf.der=wd.der --from-file=node.key=wd.key
+apiVersion: v1
+kind: Secret
+metadata:
+  name: watchdog-node
+  namespace: trust-orchestrator
+type: Opaque
+stringData:
+  node.key: "REPLACE_WITH_NODE_KEY_HEX"
+  leaf.der: "REPLACE_WITH_NODE_LEAF_BASE64"
+---
+# Calibrated detector operating point (from to-bench calibrate, reports/params.json)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orchestrator-config
+  namespace: trust-orchestrator
+data:
+  params.json: |
+    {"w1":{"mu0":1,"delta":1,"h":3},"w3":{"mu0":0.5,"delta":0.5,"h":3},"w5":{"mu0":1,"delta":0.5,"h":2}}
+---
+# The timeline the watchdogs replay (step 3). Replace this placeholder with
+# the real exported timeline before the watchdog StatefulSet will start:
+#   kubectl create configmap watchdog-events -n trust-orchestrator --from-file=timeline.json=timeline.json
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: watchdog-events
+  namespace: trust-orchestrator
+data:
+  timeline.json: |
+    {"events":[],"public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}
+---
+# --- Orchestrator: fleet server, mTLS fan-in, live ensemble verdict ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  namespace: trust-orchestrator
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: orchestrator}
+  template:
+    metadata:
+      labels: {app: orchestrator}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 65534}
+      volumes:
+        - name: node-tls
+          secret: {secretName: orchestrator-node}
+        - name: data
+          persistentVolumeClaim: {claimName: orchestrator-data}
+      containers:
+        - name: orchestrator
+          image: trust-orchestrator:latest
+          command: ["/bin/to-orchestrator", "serve"]
+          args:
+            - --listen=0.0.0.0:8333
+            - --ca=/tls/ca.der
+            - --cert=/tls/leaf.der
+            - --key=/tls/node.key
+          ports: [{containerPort: 8333}]
+          volumeMounts:
+            - {name: node-tls, mountPath: /tls, readOnly: true}
+            - {name: data, mountPath: /data}
+          readinessProbe: {tcpSocket: {port: 8333}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator
+  namespace: trust-orchestrator
+spec:
+  selector: {app: orchestrator}
+  ports: [{port: 8333, targetPort: 8333}]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: orchestrator-data
+  namespace: trust-orchestrator
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 1Gi}}
+---
+# --- Council member nodes: 5 persistent mTLS shard holders ---
+# One Deployment per member (each mounts its own shard Secret). Members are
+# stateless: epoch is in-memory (restart re-accepts).
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: council-c1, namespace: trust-orchestrator}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: council-c1}}
+  template:
+    metadata: {labels: {app: council-c1, role: council}}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 65534}
+      volumes:
+        - name: member-tls
+          secret: {secretName: council-node-1}
+      containers:
+        - name: member
+          image: trust-orchestrator:latest
+          command: ["/bin/to-council", "serve"]
+          args:
+            - --id=C1
+            - --addr=0.0.0.0:8443
+            - --shard=/tls/shard.json
+            - --ca=/tls/ca.der
+            - --cert=/tls/leaf.der
+            - --key=/tls/node.key
+          ports: [{containerPort: 8443}]
+          volumeMounts:
+            - {name: member-tls, mountPath: /tls, readOnly: true}
+          readinessProbe: {tcpSocket: {port: 8443}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: council-c1, namespace: trust-orchestrator}
+spec:
+  selector: {app: council-c1}
+  ports: [{port: 8443, targetPort: 8443}]
+---
+# ... replicate council-c1 for C2..C5 (council-c2..council-c5, secret
+# council-node-2..5, --id=C2..C5); ceremony recovery runs on the orchestrator
+# or a laptop pod dialing council-c1..c5:8443 over mTLS.
+---
+# --- Watchdogs: one replica per fleet identity (5), distinct pod names ---
+# Pod name (to-watchdog-0..4) becomes the fleet NodeID via the downward API;
+# the ensemble needs 5 distinct contributing IDs for the 3/5 quorum.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: to-watchdog
+  namespace: trust-orchestrator
+spec:
+  serviceName: to-watchdog
+  replicas: 5
+  selector:
+    matchLabels: {app: to-watchdog}
+  template:
+    metadata:
+      labels: {app: to-watchdog, role: watchdog}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 65534}
+      volumes:
+        - name: node-tls
+          secret: {secretName: watchdog-node}
+        - name: podinfo
+          downwardAPI:
+            items:
+              - {path: name, fieldRef: {fieldPath: metadata.name}}
+        - name: events
+          configMap: {name: watchdog-events}
+        - name: orchestrator-config
+          configMap: {name: orchestrator-config}
+      containers:
+        - name: watchdog
+          image: trust-orchestrator:latest
+          command: ["/bin/to-watchdog", "run"]
+          args:
+            - --events=/events/timeline.json
+            - --params=/config/params.json
+            - --kind=behavior_baseline
+            - --node-id-file=/etc/podinfo/name
+            - --live=orchestrator:8333
+            - --server-name=orchestrator
+            - --ca=/tls/ca.der
+            - --cert=/tls/leaf.der
+            - --key=/tls/node.key
+          volumeMounts:
+            - {name: node-tls, mountPath: /tls, readOnly: true}
+            - {name: podinfo, mountPath: /etc/podinfo, readOnly: true}
+            - {name: events, mountPath: /events, readOnly: true}
+            - {name: orchestrator-config, mountPath: /config, readOnly: true}
+---
+# --- Network policy: default deny, mTLS ports only ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: trust-orchestrator
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-fleet-ingest
+  namespace: trust-orchestrator
+spec:
+  podSelector:
+    matchLabels: {app: orchestrator}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {role: watchdog}}
+      ports: [{port: 8333}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-council-vote
+  namespace: trust-orchestrator
+spec:
+  podSelector:
+    matchLabels: {role: council}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {role: council}}
+        - podSelector: {matchLabels: {app: orchestrator}}
+      ports: [{port: 8443}]

@@ -513,9 +513,12 @@ not a scripted environment where the author knows the answers.
 
 ### 8.4 Calibration Procedure
 
-1. Run scenario-free traffic to establish baselines (μ₀ per detector).
-2. Sweep thresholds (h, δ) across scenarios.
-3. Select the operating point satisfying (latency ≤ L, FPR ≤ α).
+1. Run scenario-free + jittered traffic to establish baselines (μ₀ per detector).
+2. Sweep W1's h over 1..16; score each candidate on jittered-baseline FPR and
+   marginal-rate (2.5/cycle) latency.
+3. Select the operating point: smallest h with FPR ≤ α and latency ≤ L —
+   the sweep selects h=3 from data; the scenario default follows it and the
+   CLI warns loudly on any drift.
 4. **No knob is set by hand.** The ROC curves are the justification.
 
 ### 8.5 Verification Results (from reports/benchmark.json)
@@ -532,8 +535,10 @@ not a scripted environment where the author knows the answers.
 | "Residual risk is measured" | S7: omniscient-attacker gap published (undetected by design) |
 | "RTO/throughput" | workload re-issue: 90 certs < 60 s target; verify: 100k events, linear (ratio ≈ 10) |
 
-ROC operating point: h=8 (W1), h=3 (W3), h=2 (W5) with δ = 1/0.5/0.5 — pinned in
-`reports/params.json` and justified by the ROC sweep in `reports/calibration.json`.
+ROC operating point: h=3 (W1), h=3 (W3), h=2 (W5) with δ = 1/0.5/0.5 — W1's h is
+*selected by the ROC sweep* (FPR ≤ α on jittered traffic, marginal-attack
+latency ≤ L), pinned in `reports/params.json` and justified by the sweep in
+`reports/calibration.json`.
 Current runs are green end to end (unit suite, K1–K6 kill-tests, tlc.log, mutations,
 10-row benchmark; test plan §8 regression gate).
 

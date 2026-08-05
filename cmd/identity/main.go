@@ -7,10 +7,13 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	to "trustorchestrator"
@@ -29,6 +32,10 @@ func main() {
 		err = issue(args[1:])
 	case "verify":
 		err = verify(args[1:])
+	case "revoke":
+		err = revoke(args[1:])
+	case "crl":
+		err = crl(args[1:])
 	default:
 		usage()
 	}
@@ -41,8 +48,10 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   to-identity ca --key <recovered-root.key> [--name <cn>] [--out ca.der]
-  to-identity issue --ca <ca.der> --key <ca.key> --identity <name> [--serial N] [--ttl 10m] [--out leaf.der] [--key-out leaf.key]
-  to-identity verify --cert <leaf.der> --ca <ca.der>`)
+  to-identity issue --ca <ca.der> --key <ca.key> --identity <name> [--serial N] [--ttl 10m] [--crl-url <url>] [--out leaf.der] [--key-out leaf.key]
+  to-identity verify --cert <leaf.der> --ca <ca.der> [--crl <crl.der>]
+  to-identity revoke --ca <ca.der> --key <ca.key> --crl <crl.der> --serial <N[,N...]> [--out crl.der] [--next-update 24h] [--pem]
+  to-identity crl --ca <ca.der> --file <crl.der> [--now <RFC3339>]`)
 	os.Exit(1)
 }
 
@@ -131,7 +140,7 @@ func issue(args []string) error {
 		}
 	}
 	_, subjKey, _ := ed25519.GenerateKey(rand.Reader)
-	leaf, err := to.IssueWorkloadCert(ca, keyFromFile(seed), subjKey.Public().(ed25519.PublicKey), f["identity"], serial, ttl)
+	leaf, err := to.IssueWorkloadCertWithDP(ca, keyFromFile(seed), subjKey.Public().(ed25519.PublicKey), f["identity"], serial, ttl, f["crl-url"])
 	if err != nil {
 		return err
 	}
@@ -157,7 +166,7 @@ func issue(args []string) error {
 func verify(args []string) error {
 	f := flags(args)
 	if f["cert"] == "" || f["ca"] == "" {
-		return errors.New("usage: verify --cert <leaf.der> --ca <ca.der>")
+		return errors.New("usage: verify --cert <leaf.der> --ca <ca.der> [--crl <crl.der>]")
 	}
 	leaf, err := os.ReadFile(f["cert"])
 	if err != nil {
@@ -170,6 +179,147 @@ func verify(args []string) error {
 	if err := to.VerifyWorkloadChain(leaf, caDER, time.Now()); err != nil {
 		return fmt.Errorf("VERIFY: FAIL (%v)", err)
 	}
+	if crlPath := f["crl"]; crlPath != "" {
+		crlDER, err := os.ReadFile(crlPath)
+		if err != nil {
+			return err
+		}
+		if _, err := to.VerifyCRL(crlDER, caDER, time.Now()); err != nil {
+			return fmt.Errorf("VERIFY: FAIL (CRL: %v)", err)
+		}
+		revoked, err := to.CheckRevoked(leaf, crlDER)
+		if err != nil {
+			return fmt.Errorf("VERIFY: FAIL (%v)", err)
+		}
+		if revoked {
+			return errors.New("VERIFY: FAIL (certificate is REVOKED)")
+		}
+	}
 	fmt.Println("VERIFY: PASS")
+	return nil
+}
+
+// revoke adds serials to the CRL and re-signs it under the next number.
+// Without an existing --crl it mints CRL #1. The serial ledger mapping
+// cert_id -> serial lives with the issuer; the operator passes the serials
+// from the recovery report's affected set (ledger-backed revocation is the
+// upgrade path).
+func revoke(args []string) error {
+	f := flags(args)
+	if f["ca"] == "" || f["key"] == "" || f["serial"] == "" {
+		return errors.New("usage: revoke --ca <ca.der> --key <ca.key> --crl <crl.der> --serial <N[,N...]> [--out crl.der] [--next-update 24h] [--pem]")
+	}
+	caDER, err := os.ReadFile(f["ca"])
+	if err != nil {
+		return err
+	}
+	ca, err := to.ParseIdentityCA(caDER)
+	if err != nil {
+		return err
+	}
+	raw, err := os.ReadFile(f["key"])
+	if err != nil {
+		return err
+	}
+	seed, err := hex.DecodeString(string(raw))
+	if err != nil {
+		return err
+	}
+	caKey := keyFromFile(seed)
+	now := time.Now()
+	next := now.Add(24 * time.Hour)
+	if f["next-update"] != "" {
+		d, derr := time.ParseDuration(f["next-update"])
+		if derr != nil {
+			return derr
+		}
+		next = now.Add(d)
+	}
+	var serials []*big.Int
+	for _, part := range strings.Split(f["serial"], ",") {
+		n, ok := new(big.Int).SetString(strings.TrimSpace(part), 10)
+		if !ok {
+			return fmt.Errorf("bad serial %q", part)
+		}
+		serials = append(serials, n)
+	}
+	revoked := make([]to.RevokedCert, len(serials))
+	for i, s := range serials {
+		revoked[i] = to.RevokedCert{SerialNumber: s, RevokedAt: now}
+	}
+	var out []byte
+	number := int64(1)
+	if f["crl"] != "" {
+		old, err := os.ReadFile(f["crl"])
+		if err != nil {
+			return err
+		}
+		oldRL, err := to.VerifyCRL(old, caDER, now)
+		if err != nil {
+			return err
+		}
+		number = oldRL.Number.Int64() + 1
+		out, err = to.AppendRevocation(ca, caKey, old, number, revoked, now, next)
+		if err != nil {
+			return err
+		}
+	} else {
+		out, err = to.NewCRL(ca, caKey, number, revoked, now, next)
+		if err != nil {
+			return err
+		}
+	}
+	outPath := f["out"]
+	if outPath == "" {
+		outPath = f["crl"]
+	}
+	if outPath == "" {
+		outPath = "crl.der"
+	}
+	if err := os.WriteFile(outPath, out, 0o644); err != nil {
+		return err
+	}
+	if f["pem"] != "" {
+		pemPath := outPath + ".pem"
+		pemB := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: out})
+		if err := os.WriteFile(pemPath, pemB, 0o644); err != nil {
+			return err
+		}
+		fmt.Printf("CRL #%d: %d revoked, next update %s -> %s (+ %s)\n", number, len(revoked), next.Format(time.RFC3339), outPath, pemPath)
+	} else {
+		fmt.Printf("CRL #%d: %d revoked, next update %s -> %s\n", number, len(revoked), next.Format(time.RFC3339), outPath)
+	}
+	return nil
+}
+
+// crl inspects a published CRL: signature, window, and revoked serials.
+func crl(args []string) error {
+	f := flags(args)
+	if f["ca"] == "" || f["file"] == "" {
+		return errors.New("usage: crl --ca <ca.der> --file <crl.der> [--now <RFC3339>]")
+	}
+	caDER, err := os.ReadFile(f["ca"])
+	if err != nil {
+		return err
+	}
+	crlDER, err := os.ReadFile(f["file"])
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	if f["now"] != "" {
+		if now, err = time.Parse(time.RFC3339, f["now"]); err != nil {
+			return err
+		}
+	}
+	rl, err := to.VerifyCRL(crlDER, caDER, now)
+	if err != nil {
+		return fmt.Errorf("CRL: INVALID (%v)", err)
+	}
+	fmt.Printf("CRL: VALID #%d (this update %s, next %s, %d revoked)\n",
+		rl.Number.Int64(), rl.ThisUpdate.Format(time.RFC3339), rl.NextUpdate.Format(time.RFC3339), len(rl.RevokedCertificateEntries))
+	for _, e := range rl.RevokedCertificateEntries {
+		fmt.Printf("  serial %s revoked %s\n", e.SerialNumber, e.RevocationTime.Format(time.RFC3339))
+	}
 	return nil
 }

@@ -14,11 +14,12 @@ skipped/partially implemented** — the same table a judge can read in
 | D6 | Live calibration | in-process scenario clock, not real wall-time fleet | Internal |
 | D7 | `p-value` in scores | placeholder flat 0.01 on alarm | Placeholder |
 | D8 | Best-of-3 scaling timing | stochastic bound (3 runs, scheduler noise) | Noise-sensitive |
-| D9 | Deploy plumbing | systemd units shipped (`deploy/*.service`); not run on real hosts | Docs |
+| D9 | Deploy plumbing | systemd units + container + K8s manifest shipped (`deploy/*`); not run on real hosts | Docs |
 | D10 | Production bootstrap key | dev `bootstrap.key` in repo | Dev-only |
 | D11 | Windows-only dev | **Linux cross-build now proven** — `make build-linux` → static ELFs | Ported |
 | D12 | TLA mutation tests | P2/P6 violated logs are proofs, not code | Audit |
 | D13 | Network partitions simulated | loopback partition, not router-level | Simulated |
+| D14 | CRL ops | CRL issue/append/verify shipped and tested; reason codes, delta CRLs, OCSP, ledger-backed auto-revocation deferred | Partial |
 
 ## The honest answer to "is anything faked?"
 
@@ -41,3 +42,5 @@ DNS query each cycle and scores the fleet on it (exit 0 → 100, non-zero → 0;
 Highest-value, smallest-effort next step:
 - run the `deploy/*.service` units against a real `bin/linux` host (WSL) —
   `deploy/fleet-smoke.sh` already proves the same binaries end-to-end
+- `make docker-build` + `kubectl apply -f deploy/kubernetes.yaml` on a real
+  cluster, with the bootstrap ceremony from docs/08 §Kubernetes

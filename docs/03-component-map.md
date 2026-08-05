@@ -11,12 +11,13 @@ Every source file, its job, key functions, and how it's tested.
 | `ensemble.go` | fusion: DETECTED ⇔ ≥quorum low scores | `Detect`, `Score` |
 | `detect.go` | threshold/quorum helpers, conditional logic | `Detect`, `Escalation` helpers |
 | `audit.go` | auditor mirror, policy check, escalation | `Mirror`, `Verify`, `CheckPolicy`, `DetectEscalated` |
-| `council.go` | recovery council, votes, permissions | `Recover`, `CreateRecovery` |
+| `council.go` | recovery council, votes, permissions | `Recover`, `SignCommit`, `recoverFork`, `finishRecovery` |
+| `councilnet.go` | networked council protocol (two rounds over mTLS) | `RemoteRecover`, `CouncilMemberServer`, `MemberEndpoint` |
 | `shamir.go` | Shamir secret sharing 3-of-5 | `Split`, `Reconstruct` |
 | `rollback.go` | refold to checkpoint, invalidation set | `Rollback`, `invalidateReachable` |
 | `graph.go` | trust graph + scoped reachability | `InvalidationSetScoped` |
 | `consumer.go` | consumer rules engine (delta application) | `ApplyDelta`; `consumerState` |
-| `identity.go` | workload certificate authority | `NewIdentityCA`, `IssueWorkloadCert`, `Verify` |
+| `identity.go` | workload certificate authority + CRL lifecycle | `NewIdentityCA`, `IssueWorkloadCertWithDP`, `NewCRL`, `AppendRevocation`, `VerifyCRL`, `CheckRevoked` |
 | `mtls.go` | mutual TLS configs (stdlib) | `MutualTLSConfig`, `VerifyPeerIdentity` |
 | `transport.go` | framed mTLS wire client/server | `DialWire`, `WriteWire`, `ServeWire`, `WireMsg` |
 | `bench.go` | scenario runner (S1–S7) | `Bench`, `RunAll`, `Calibrate` |
@@ -28,9 +29,9 @@ Every source file, its job, key functions, and how it's tested.
 |---|---|---|
 | `cmd/to` | `to-tool` (base: genkey,shard,enroll,bench) + `to-bench` + `to-watchdog` (enroll/run) | the Swiss-army CLI, dispatch by argv[0] |
 | `cmd/orchestrator` | `to-orchestrator status / timeline / verify / graph / policy reload / rollback --dry-run` | reads event files |
-| `cmd/council` | recovery DAC CLI (`to-council validate`) | reads share files |
+| `cmd/council` | `to-council serve` (networked member node) + `recover` (shard files) | member node: shard + mTLS; recover: share files |
 | `cmd/auditor` | `to-auditor audit --log` | mirror log checker |
-| `cmd/identity` | `to-identity ca / issue / verify` | daemon-ish cert CA |
+| `cmd/identity` | `to-identity ca / issue / revoke / crl / verify` | CA + CRL issuance, revocation, inspection |
 | `cmd/pdp` | `to-pdp check --policy --events` | policy decision point |
 
 ## Test files
@@ -39,10 +40,12 @@ Every source file, its job, key functions, and how it's tested.
 |---|---|---|
 | `core_test.go` | timelines, all scopes, quorums, escalations, `TestMutualTLSRequest`, `TestEndToEnd...` | 22 |
 | `timeline_test.go` | chain/fork/fold/CUSUM/ensemble/bad-locate | 8 |
-| `identity_test.go` | cert CA, expiry, workload reissue | 3 |
+| `identity_test.go` | cert CA, expiry, workload reissue, CRL lifecycle (create/verify/append/revoked/foreign/expired/DP) | 8 |
 | `consumer_test.go` | deltas | 2 |
 | `kill_test.go` | K1–K6 fault injection | 6 |
 | `transport_test.go` | `TestWireRealSockets` | 1 |
+| `councilnet_test.go` | networked recovery end-to-end + blocked-quorum | 2 |
+| `fleet_test.go` | fleet fan-in, live verdicts | 2 |
 | `cmd/to/main_test.go` | enjoy + revoke | 3 |
 
 Total 45. All green: `go test ./... -count=1`.

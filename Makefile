@@ -3,10 +3,11 @@
 
 BIN      := bin
 GO       := go
+DOCKER   := docker
 GOOS_    := linux
 GOARCH_  := amd64
 
-.PHONY: all build build-linux test benchmark kill-tests model-check model-check-mutations fleet-smoke clean
+.PHONY: all build build-linux test benchmark kill-tests model-check model-check-mutations fleet-smoke docker-build clean
 
 all: build
 
@@ -40,6 +41,12 @@ build-linux:
 # (deploy/fleet-smoke.sh, deployment guide §5).
 fleet-smoke:
 	bash deploy/fleet-smoke.sh
+
+# docker-build: the container image (guide §12 K8s). Static, stdlib-only —
+# scratch base, no OS cert bundle. Requires docker; the same binaries are
+# verified as linux ELFs by build-linux and CI.
+docker-build:
+	$(DOCKER) build -t trust-orchestrator:latest .
 
 test:
 	$(GO) test ./...

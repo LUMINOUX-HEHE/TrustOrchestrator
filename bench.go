@@ -13,15 +13,33 @@ import (
 //
 // One parameter set for every scenario (anti-overfit, D6):
 //
-//	W1 rate_cusum:     mu0=1,  delta=1,   h=8   (max undetectable 2/cycle)
+//	W1 rate_cusum:     mu0=1,  delta=1,   h=3   (max undetectable 2/cycle)
 //	W3 graph_anomaly:  mu0=0.5, delta=0.5, h=3
 //	W5 behavior:       mu0 per identity, delta=0.5, h=2  ("user" baseline=1)
 //	W2 log_integrity / W4 external_probe: fire on tamper/mirror mismatch.
+//
+// W1's h is NOT hand-pinned: Calibrate sweeps h over 1..16 and selects the
+// smallest h whose false-positive rate on jittered traffic is <= alpha and
+// whose detection latency on a marginal-rate attack (2.5/cycle) fits maxLat.
+// The sweep's selected value is the published h and the scenario default
+// (Bench.h1); a drift between them is a loud warning, never a silent one.
 
 const (
 	threshold = 25.0
 	quorum    = 3
 )
+
+// defaultH1 is the last calibrated W1 operating point; Calibrate re-selects
+// it from data and the CLI warns when the two diverge.
+const defaultH1 = 3.0
+
+// calRow is one ROC-sweep candidate in Calibrate.
+type calRow struct {
+	h    float64
+	fpr  bool
+	lat  time.Duration
+	ok   bool
+}
 
 // Metrics is the published evidence for one scenario (SRS FR9.2). The last
 // fields carry the NFR3 measurements (re-issuance workload, verify scaling).
@@ -45,18 +63,27 @@ type Metrics struct {
 
 type Bench struct {
 	cycle time.Duration
+	h1    float64 // calibrated W1 operating point (defaultH1 until re-selected)
 }
 
 func NewBench(cycle time.Duration) *Bench {
 	if cycle == 0 {
 		cycle = 30 * time.Second
 	}
-	return &Bench{cycle: cycle}
+	return &Bench{cycle: cycle, h1: defaultH1}
 }
 
-// watchdogs wires the five documented detectors (FR2.1).
+// DefaultH1 exposes the calibrated W1 operating point to the CLIs' param
+// defaults (params.json overrides at runtime).
+func DefaultH1() float64 { return defaultH1 }
+
+// H1 exposes the scenario W1 operating point (calibration drift check).
+func (b *Bench) H1() float64 { return b.h1 }
+
+// watchdogs wires the five documented detectors (FR2.1) at the calibrated
+// W1 operating point.
 func (b *Bench) watchdogs(tl *Timeline, log *AuditorLog) []*Watchdog {
-	return b.watchdogsH(tl, log, 8)
+	return b.watchdogsH(tl, log, b.h1)
 }
 
 // watchdogsH is watchdogs with W1's decision bound parameterized — the
@@ -540,63 +567,139 @@ func (b *Bench) ScenarioVerifyScaling() Metrics {
 	return m
 }
 
-// Calibrate selects the operating point for (FPR <= alpha, latency <= maxLat)
-// from baseline traffic (calibration §8, N3). No knob is set by hand (D6).
+// Calibrate selects the W1 operating point from data — no knob is hand-set
+// (N3, D6). The sweep runs h over 1..16; each candidate is scored on:
 //
-// The sweep (test plan §8.2): W1's h runs over 1..16; each candidate is
-// scored on scenario-free baseline traffic (FPR) and on the S1 burst
-// (latency). On the baseline W1 never drifts (1 issue/cycle vs mu0=1 leaves
-// S=0), so every candidate satisfies FPR <= alpha; S1 latency is set by
-// W3/W4/W5 and is invariant to h1 — the table records exactly that, plus
-// the pinned operating point h=8 (the value the S-matrix uses for >2/cycle
-// sustained attacks). This is the ROC evidence: no point beats the
-// operating point on either axis.
+//   - jitteredBaselineBatches (FPR): honest 1/cycle traffic with occasional
+//     short rate-3 bursts. Each 2-cycle burst drives CUSUM to S=2, so h <= 2
+//     false-alarms; h >= 3 stays silent. This makes FPR vary with h — the
+//     ROC tradeoff is real, not decorative.
+//   - marginalAttackBatches (latency): sustained 2.5/cycle (just above the
+//     mu0+delta=2 bound) after cycle 50; CUSUM drifts +0.5/cycle, so latency
+//     grows with h. Selection: smallest h with FPR <= alpha that detects the
+//     marginal attack within maxLat (smallest h = earliest detection among
+//     FPR-valid candidates).
+//
+// On the current traffic this selects h=3: FPR 0 on 200 jittered cycles,
+// marginal attack detected 6 cycles (3 min) after onset.
 func (b *Bench) Calibrate(alpha float64, maxLat time.Duration) (delta, h float64, report []byte, err error) {
 	base := b.ScenarioBaseline()
 	baseFPR := 0.0
 	if base.FalsePositive {
 		baseFPR = 1.0
 	}
-	const operatingH = 8.0 // the pinned W1 bound (bench.go header)
 	if baseFPR > alpha {
 		return 0, 0, nil, fmt.Errorf("baseline FPR %v exceeds alpha %v; recalibrate mu0", baseFPR, alpha)
 	}
-	// ROC sweep: (h, baseline FPR, S1 latency) — h over the full candidate set.
 	_, sweepKey, _ := ed25519.GenerateKey(rand.Reader)
-	sweep := make([]map[string]any, 0, 16)
+	rows := make([]calRow, 0, 16)
 	for h1 := 1.0; h1 <= 16; h1++ {
 		tl, log := NewTimeline(sweepKey), &AuditorLog{}
-		fp, _, _ := b.simulateWith(tl, log, b.baselineBatches(), -1, -1, b.watchdogsH(tl, log, h1))
-		m, _, _ := b.s1H(h1)
-		lat := m.DetectionLatency.String()
-		if !m.Detected {
-			lat = "none"
+		fp, _, _ := b.simulateWith(tl, log, b.jitteredBaselineBatches(), -1, -1, b.watchdogsH(tl, log, h1))
+		mtl, mlog := NewTimeline(sweepKey), &AuditorLog{}
+		dc, _, _ := b.simulateWith(mtl, mlog, b.marginalAttackBatches(), -1, -1, b.watchdogsH(mtl, mlog, h1))
+		r := calRow{h: h1, fpr: fp >= 0, ok: dc >= 0}
+		if dc >= 0 {
+			r.lat = time.Duration(dc-50) * b.cycle
 		}
-		sweep = append(sweep, map[string]any{
-			"h":            h1,
-			"baseline_fpr": fp >= 0,
-			"s1_detected":  m.Detected,
-			"s1_latency":   lat,
-			"selected":     h1 == operatingH,
-		})
+		rows = append(rows, r)
 	}
+	selected := -1
+	for i, r := range rows {
+		if r.fpr || !r.ok || r.lat > maxLat {
+			continue
+		}
+		if selected < 0 || r.lat < rows[selected].lat ||
+			(r.lat == rows[selected].lat && r.h < rows[selected].h) {
+			selected = i
+		}
+	}
+	if selected < 0 {
+		return 0, 0, nil, fmt.Errorf("calibration: no h satisfies FPR<=%v and latency<=%v on this traffic", alpha, maxLat)
+	}
+	hSel := rows[selected].h
 	rep, _ := json.MarshalIndent(map[string]any{
 		"delta":            1.0,
-		"h":                operatingH,
+		"h":                hSel,
 		"alpha":            alpha,
 		"max_latency":      maxLat.String(),
 		"baseline_fpr":     baseFPR,
-		"calibration_note": "W1 never drifts on baseline traffic (S = max(0, S + x - mu0 - delta) stays 0 at 1 issue/cycle), so all candidate h satisfy FPR <= alpha; the operating point is the published h=8 bound for >2/cycle sustained attacks (S1-S7 stay under it by design). Ensemble latency is set by W3/W4/W5 and is invariant to W1 h (reported, not hidden).",
-		"roc_sweep":        sweep,
+		"selection_rule":   "smallest h with jittered-baseline FPR <= alpha and marginal-attack (2.5/cycle) latency <= maxLat",
+		"selected_latency": rows[selected].lat.String(),
+		"roc_sweep":        sweepJSON(rows),
 	}, "", "  ")
-	return 1.0, operatingH, rep, nil
+	return 1.0, hSel, rep, nil
 }
 
-// baselineBatches is the scenario-free traffic used by the ROC sweep.
-func (b *Bench) baselineBatches() [][]TrustEvent {
+func sweepJSON(rows []calRow) []map[string]any {
+	out := make([]map[string]any, 0, len(rows))
+	sel := best(rows)
+	for i, r := range rows {
+		lat := "never"
+		if r.ok {
+			lat = r.lat.String()
+		}
+		out = append(out, map[string]any{
+			"h":                r.h,
+			"jittered_fpr":     r.fpr,
+			"marginal_latency": lat,
+			"selected":         i == sel,
+		})
+	}
+	return out
+}
+
+// best mirrors Calibrate's selection rule over the FPR-valid, detected
+// candidates (used for the sweep table's "selected" flag).
+func best(rows []calRow) int {
+	sel := -1
+	for i, r := range rows {
+		if r.fpr || !r.ok {
+			continue
+		}
+		if sel < 0 || r.lat < rows[sel].lat || (r.lat == rows[sel].lat && r.h < rows[sel].h) {
+			sel = i
+		}
+	}
+	return sel
+}
+
+// jitteredBaselineBatches is the FPR side of the ROC sweep: honest 1/cycle
+// traffic with a 2-cycle rate-3 burst every 50 cycles. Each burst drives
+// CUSUM to S=2 (3-1-1 = +1 per cycle, then decay), so h<=2 false-alarms and
+// h>=3 stays silent — FPR varies with h, making the selection real.
+func (b *Bench) jitteredBaselineBatches() [][]TrustEvent {
 	batches := make([][]TrustEvent, 0, 200)
 	for i := 0; i < 200; i++ {
-		batches = append(batches, []TrustEvent{{Type: EvIssue, Payload: issue(fmt.Sprintf("c%d", i), "user", "", int64(i))}})
+		batch := []TrustEvent{{Type: EvIssue, Payload: issue(fmt.Sprintf("c%d", i), "user", "", int64(i))}}
+		if i%50 == 49 || i%50 == 0 && i > 0 { // 2-cycle bursts at cycles 49-50, 99-100, ...
+			batch = append(batch, TrustEvent{Type: EvIssue, Payload: issue(fmt.Sprintf("j%d", i), "user", "", int64(i))},
+				TrustEvent{Type: EvIssue, Payload: issue(fmt.Sprintf("j%d-b", i), "user", "", int64(i))})
+		}
+		batches = append(batches, batch)
+	}
+	return batches
+}
+
+// marginalAttackBatches is the latency side of the ROC sweep: honest
+// 1/cycle traffic, then a sustained 2.5/cycle drip (3- and 2-issue cycles
+// alternating, just above the W1 mu0+delta=2 bound) from cycle 50. CUSUM
+// drifts +0.5/cycle, so the detection cycle is 50+2h — latency grows with h
+// here, which is what makes the sweep select.
+func (b *Bench) marginalAttackBatches() [][]TrustEvent {
+	batches := make([][]TrustEvent, 0, 200)
+	for i := 0; i < 200; i++ {
+		batch := []TrustEvent{{Type: EvIssue, Payload: issue(fmt.Sprintf("n%d", i), "user", "", int64(i))}}
+		if i >= 50 {
+			extra := 1 // x alternates 2,3 -> mean 2.5/cycle
+			if i%2 == 0 {
+				extra = 2
+			}
+			for j := 0; j < extra; j++ {
+				batch = append(batch, TrustEvent{Type: EvIssue, Payload: issue(fmt.Sprintf("m%d-%d", i, j), "user", "", int64(i))})
+			}
+		}
+		batches = append(batches, batch)
 	}
 	return batches
 }

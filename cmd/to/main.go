@@ -370,6 +370,9 @@ func bench(args []string) error {
 	if err != nil {
 		return err
 	}
+	if h != b.H1() {
+		fmt.Printf("\nWARNING: scenario evidence ran at W1 h=%v but calibration selects h=%v — re-run `bench` so the S-matrix uses the operating point.\n", b.H1(), h)
+	}
 	fmt.Printf("\noperating point: h=%v\n%s\n", h, cal)
 	if outDir != "" {
 		os.WriteFile(outDir+"/calibration.json", cal, 0o644)
@@ -430,7 +433,8 @@ func calibrate(args []string) error {
 // come from params.json (FR2.5: calibration output, never hand-set).
 func watchdogRun(args []string) error {
 	eventsFile, paramsFile, kind := "", "", "rate_cusum"
-	live, caPath, certPath, keyPath, nodeID, serverName, probeCmd := "", "", "", "", "", "", ""
+	live, caPath, certPath, keyPath := "", "", "", ""
+	nodeID, nodeIDFile, serverName, probeCmd := "", "", "", ""
 	tail := -1
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -464,6 +468,11 @@ func watchdogRun(args []string) error {
 				nodeID = args[i+1]
 				i++
 			}
+		case "--node-id-file": // StatefulSet identity: pod name from a downward-API file
+			if i+1 < len(args) {
+				nodeIDFile = args[i+1]
+				i++
+			}
 		case "--ca":
 			if i+1 < len(args) {
 				caPath = args[i+1]
@@ -492,7 +501,14 @@ func watchdogRun(args []string) error {
 		}
 	}
 	if eventsFile == "" {
-		return errors.New("usage: run --events <file> [--kind <detector>] [--params <params.json>] [--live <orch-addr> --ca <ca.der> --cert <leaf.der> --key <key.hex>] [--probe-cmd <shell-cmd>]")
+		return errors.New("usage: run --events <file> [--kind <detector>] [--params <params.json>] [--node-id <id>|--node-id-file <file>] [--live <orch-addr> --ca <ca.der> --cert <leaf.der> --key <key.hex>] [--probe-cmd <shell-cmd>]")
+	}
+	if nodeID == "" && nodeIDFile != "" {
+		b, err := os.ReadFile(nodeIDFile)
+		if err != nil {
+			return err
+		}
+		nodeID = strings.TrimSpace(string(b))
 	}
 	tl, err := loadTimelineOrEvidence(eventsFile)
 	if err != nil {
@@ -505,7 +521,7 @@ func watchdogRun(args []string) error {
 	if len(evs) == 0 {
 		return errors.New("run: no events in timeline")
 	}
-	mu0, delta, h := 1.0, 1.0, 8.0
+	mu0, delta, h := 1.0, 1.0, to.DefaultH1()
 	switch kind {
 	case to.WDGraphAnomaly:
 		mu0, delta, h = 0.5, 0.5, 3

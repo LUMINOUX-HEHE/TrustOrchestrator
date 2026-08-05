@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 )
 
 // Event types (wire contract, architecture report §5.1).
@@ -49,6 +50,7 @@ func (e TrustEvent) Hash() []byte {
 // ponytail: linear hash chain, not a binary Merkle tree — inclusion proofs
 // are needed only when auditor logs exist; add the tree then.
 type Timeline struct {
+	mu     sync.Mutex
 	events []TrustEvent
 	key    ed25519.PrivateKey // nil for read-only (loaded) timelines
 	pub    ed25519.PublicKey  // verification key; equals key.Public() when key != nil
@@ -60,6 +62,12 @@ func NewTimeline(key ed25519.PrivateKey) *Timeline {
 
 // Head returns the hash of the last event, or nil for an empty chain.
 func (t *Timeline) Head() []byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.head()
+}
+
+func (t *Timeline) head() []byte {
 	if len(t.events) == 0 {
 		return nil
 	}
@@ -67,14 +75,22 @@ func (t *Timeline) Head() []byte {
 }
 
 // Events exposes the chain for read-only consumers (auditors, operators).
-func (t *Timeline) Events() []TrustEvent { return t.events }
+func (t *Timeline) Events() []TrustEvent {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	cp := make([]TrustEvent, len(t.events))
+	copy(cp, t.events)
+	return cp
+}
 
 // Append signs and chains a new event onto the current head (FR1.1, FR1.3).
 func (t *Timeline) Append(typ string, payload []byte, ts int64) ([]byte, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if t.key == nil {
 		return nil, fmt.Errorf("timeline: read-only (loaded from file)")
 	}
-	e := TrustEvent{Type: typ, Timestamp: ts, Payload: payload, ParentHash: t.Head()}
+	e := TrustEvent{Type: typ, Timestamp: ts, Payload: payload, ParentHash: t.head()}
 	e.Signature = ed25519.Sign(t.key, e.canonical())
 	t.events = append(t.events, e)
 	return e.Hash(), nil
@@ -82,13 +98,17 @@ func (t *Timeline) Append(typ string, payload []byte, ts int64) ([]byte, error) 
 
 // Verify re-hashes the chain and re-checks every signature (FR1.2).
 func (t *Timeline) Verify() bool {
-	return t.LocateBadEvent() == -1
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.locateBadEvent() == -1
 }
 
 // VerifyPrefix verifies only events[0..n-1] (FR1.2). Recovery verifies the
 // good prefix — the tampered region beyond it is exactly what recovery
 // rolls back from.
 func (t *Timeline) VerifyPrefix(n int) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if n > len(t.events) {
 		n = len(t.events)
 	}
@@ -110,6 +130,12 @@ func (t *Timeline) VerifyPrefix(n int) bool {
 // LocateBadEvent returns the index of the first event that breaks the chain
 // (parent mismatch or bad signature), or -1 (W2 detector core, §6.1).
 func (t *Timeline) LocateBadEvent() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.locateBadEvent()
+}
+
+func (t *Timeline) locateBadEvent() int {
 	for i, e := range t.events {
 		if i == 0 && e.ParentHash != nil {
 			return i
@@ -128,6 +154,8 @@ func (t *Timeline) LocateBadEvent() int {
 // preserved by the caller as evidence (architecture §5.1); replay of the
 // trusted prefix is implicit in the copy.
 func (t *Timeline) Fork(atHash []byte) (*Timeline, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	idx := -1
 	for i := range t.events {
 		if bytes.Equal(t.events[i].Hash(), atHash) {
@@ -169,6 +197,8 @@ func (t *Timeline) Save(path string, includeKey bool) error {
 
 // MarshalTimeline is the JSON form used by Save and by evidence files.
 func (t *Timeline) Marshal(includeKey bool) ([]byte, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	f := timelineFile{Events: t.events, Pub: t.pub}
 	if includeKey && t.key != nil {
 		f.Key = t.key
@@ -185,11 +215,19 @@ func LoadTimeline(path string) (*Timeline, error) {
 	return UnmarshalTimeline(b)
 }
 
-// UnmarshalTimeline parses a timeline from its JSON form.
+// UnmarshalTimeline parses a timeline from its JSON form. The keys are
+// validated at parse time: ed25519.Verify/Sign panic on wrong-length keys,
+// and a crafted file must fail cleanly, not crash the verifier.
 func UnmarshalTimeline(b []byte) (*Timeline, error) {
 	var f timelineFile
 	if err := json.Unmarshal(b, &f); err != nil {
 		return nil, err
+	}
+	if len(f.Pub) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("timeline: bad public key length %d", len(f.Pub))
+	}
+	if len(f.Key) != 0 && len(f.Key) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("timeline: bad private key length %d", len(f.Key))
 	}
 	return &Timeline{events: f.Events, pub: f.Pub, key: f.Key}, nil
 }
@@ -208,6 +246,8 @@ type issuePayload struct {
 // Fold derives the trust state from the event prefix. Rollback is just a
 // fold of a shorter prefix — nothing else (architecture §6.5).
 func (t *Timeline) Fold() *State {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	s := &State{Certs: map[string]Cert{}}
 	for _, e := range t.events {
 		switch e.Type {

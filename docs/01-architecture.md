@@ -58,7 +58,13 @@ DETECTED(A) = #{ nodes : Score < threshold } ≥ quorum
 3. Invalidation set = reachable subgraph from first bad event (BFS over
    `graph.go` edges) — minimal blast radius L4
 4. Re-issue only damaged identities; signed into the new fork (`reports/
-   cancanonical` artifacts)
+   canonical` artifacts)
+
+The recovery state machine (council.go) is shared by the in-process path and
+the networked protocol (councilnet.go): `to-council serve` members hold the
+shards and answer VOTE / COMMIT_REQ over mTLS — the initiator never sees
+member keys, members re-verify P3/P5 before signing the epoch descriptor, and
+≥3 valid member signatures form the COMMIT.
 
 ## Transport
 

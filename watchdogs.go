@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
+	"sync"
 )
 
 // Watchdog kinds (FR2.1).
@@ -20,6 +21,7 @@ const (
 // W1/W3/W5 share the CUSUM core; W2 = chain gap locator; W4 = mirror
 // cross-check. mu0/delta/h come from TrustOps calibration, never by hand.
 type Watchdog struct {
+	mu       sync.Mutex
 	ID       string
 	Kind     string
 	mu0      float64
@@ -34,6 +36,7 @@ type Watchdog struct {
 	badStart int                // earliest suspicious index (evidence anchor)
 	checked  int                // W2: events verified so far
 	cycles   int                // W2: full-verify cadence counter
+	cached   *Score             // one score per batch: Score() is idempotent
 }
 
 func NewWatchdog(id, kind string, mu0, delta, h float64, tl *Timeline, log *AuditorLog) *Watchdog {
@@ -58,6 +61,9 @@ func NewWatchdogBaseline(id, kind string, mu0, delta, h float64, tl *Timeline, l
 // ObserveBatch feeds one 30s cycle of events; updates detector state. W2/W4
 // are stateless per batch (they read the timeline/mirror at Score time).
 func (w *Watchdog) ObserveBatch(events []TrustEvent, firstIdx int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.cached = nil
 	w.firstIdx = firstIdx
 	issues, edges := 0, 0
 	perID := map[string]int{}
@@ -108,10 +114,23 @@ func (w *Watchdog) observeShift(c *CUSUM, firstIdx int) {
 }
 
 // Score emits the output contract (FR2.2). Low score = bad; evidence names
-// the trigger and carries the rollback anchor. ponytail: p-value is a
-// placeholder (0.01 on alarm) — a real distribution fit is calibration
+// the trigger and carries the rollback anchor. Idempotent: the same score
+// is returned for one batch no matter how often Score is called, so W2's
+// verify-cadence counters advance exactly once per batch. ponytail: p-value
+// is a placeholder (0.01 on alarm) — a real distribution fit is calibration
 // work, not detector logic.
 func (w *Watchdog) Score() Score {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.cached != nil {
+		return *w.cached
+	}
+	s := w.computeScore()
+	w.cached = &s
+	return s
+}
+
+func (w *Watchdog) computeScore() Score {
 	s := Score{NodeID: w.ID, PValue: 1.0}
 	alarm := false
 	switch w.Kind {

@@ -3,6 +3,8 @@ package trustorchestrator
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/x509"
+	"math/big"
 	"testing"
 	"time"
 )
@@ -84,5 +86,125 @@ func TestIdentityWorkloadReissueTarget(t *testing.T) {
 	}
 	if d := time.Since(start); d > 60*time.Second {
 		t.Fatalf("180 certs took %v, target <= 60s", d)
+	}
+}
+
+// CRL lifecycle: create -> verify -> revoke -> append -> rejected checks.
+
+func TestCRLCreateVerify(t *testing.T) {
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	ca, caDER, _ := NewIdentityCA(key, "identity CA", time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	now := time.Now()
+	crl, err := NewCRL(ca, key, 1, []RevokedCert{
+		{SerialNumber: big.NewInt(42), RevokedAt: now},
+	}, now.Add(-time.Minute), now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyCRL(crl, caDER, now); err != nil {
+		t.Fatalf("self-signed CRL must verify: %v", err)
+	}
+	// Forged: signed by a different CA -> rejected.
+	_, otherKey, _ := ed25519.GenerateKey(rand.Reader)
+	otherCA, _, _ := NewIdentityCA(otherKey, "other CA", now.Add(-time.Hour), now.Add(time.Hour))
+	forged, err := NewCRL(otherCA, otherKey, 1, nil, now.Add(-time.Minute), now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyCRL(forged, caDER, now); err == nil {
+		t.Fatal("foreign-signed CRL must fail verification")
+	}
+	// Stale: validity window in the past -> rejected.
+	old, err := NewCRL(ca, key, 2, nil, now.Add(-2*time.Hour), now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyCRL(old, caDER, now); err == nil {
+		t.Fatal("expired CRL must fail verification")
+	}
+	// Garbage -> parse error, not panic.
+	if _, err := VerifyCRL([]byte{0x30, 0x03, 0xff}, caDER, now); err == nil {
+		t.Fatal("garbage CRL must fail")
+	}
+}
+
+func TestCRLRevokedCertDetected(t *testing.T) {
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	ca, _, _ := NewIdentityCA(key, "identity CA", time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	now := time.Now()
+	_, subj, _ := ed25519.GenerateKey(rand.Reader)
+	leaf, err := IssueWorkloadCert(ca, key, subj.Public().(ed25519.PublicKey), "user-1", 42, 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	crl, err := NewCRL(ca, key, 1, []RevokedCert{{SerialNumber: big.NewInt(42), RevokedAt: now}}, now, now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	revoked, err := CheckRevoked(leaf, crl)
+	if err != nil || !revoked {
+		t.Fatalf("serial 42 must be on the CRL (revoked=%v err=%v)", revoked, err)
+	}
+	// Serial 43 was never revoked.
+	leaf2, _ := IssueWorkloadCert(ca, key, subj.Public().(ed25519.PublicKey), "user-1", 43, 10*time.Minute)
+	revoked, err = CheckRevoked(leaf2, crl)
+	if err != nil || revoked {
+		t.Fatalf("serial 43 must be clean (revoked=%v err=%v)", revoked, err)
+	}
+	// Garbage inputs fail, not panic.
+	if _, err := CheckRevoked([]byte{0x30}, crl); err == nil {
+		t.Fatal("garbage leaf must fail")
+	}
+	if _, err := CheckRevoked(leaf, []byte{0x30}); err == nil {
+		t.Fatal("garbage CRL must fail")
+	}
+}
+
+func TestCRLAppendRevocation(t *testing.T) {
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	ca, caDER, _ := NewIdentityCA(key, "identity CA", time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	now := time.Now()
+	crl, err := NewCRL(ca, key, 1, []RevokedCert{{SerialNumber: big.NewInt(1), RevokedAt: now}}, now, now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	crl2, err := AppendRevocation(ca, key, crl, 2,
+		[]RevokedCert{{SerialNumber: big.NewInt(2), RevokedAt: now}, {SerialNumber: big.NewInt(1), RevokedAt: now}}, // dup serial 1
+		now, now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rl, err := VerifyCRL(crl2, caDER, now)
+	if err != nil {
+		t.Fatalf("appended CRL must verify: %v", err)
+	}
+	if rl.Number.Int64() != 2 {
+		t.Fatalf("CRL number = %d, want 2", rl.Number.Int64())
+	}
+	if got := len(rl.RevokedCertificateEntries); got != 2 {
+		t.Fatalf("CRL carries %d entries, want 2 (dup dropped)", got)
+	}
+}
+
+func TestIssueWorkloadCertWithDP(t *testing.T) {
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	ca, _, _ := NewIdentityCA(key, "identity CA", time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	_, subj, _ := ed25519.GenerateKey(rand.Reader)
+	leaf, err := IssueWorkloadCertWithDP(ca, key, subj.Public().(ed25519.PublicKey), "user-1", 1, time.Minute, "http://ca/identity.crl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := x509.ParseCertificate(leaf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.CRLDistributionPoints) != 1 || parsed.CRLDistributionPoints[0] != "http://ca/identity.crl" {
+		t.Fatalf("CRL distribution points = %v", parsed.CRLDistributionPoints)
+	}
+	// Legacy wrapper: no DP stamped.
+	plain, _ := IssueWorkloadCert(ca, key, subj.Public().(ed25519.PublicKey), "user-1", 2, time.Minute)
+	parsed, _ = x509.ParseCertificate(plain)
+	if len(parsed.CRLDistributionPoints) != 0 {
+		t.Fatalf("legacy issue must not stamp a DP, got %v", parsed.CRLDistributionPoints)
 	}
 }

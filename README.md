@@ -35,16 +35,16 @@ single machine deciding anything alone.
 | P2 | One compromised watchdog can neither trigger nor block detection | `Detect(≥3/5)` + `TestInsiderCan'tTrigger` |
 | P3 | Rollback never resurrects a revoked certificate | `TestFoldNoResurrection` |
 | P4 | Detection converges on a single canonical timeline | `TestEpochCommitValidity` |
-| P5 | Corrupted followers never win / minimal blast radius | mutation of P6, TLC violation + `InvalidationSet` |
+| P5 | Corrupted followers never win / minimal blast radius | TLC `P5MinimalBlast` + `InvalidationSet` + `VerifyRecovery` |
 | P6 | Only the council can execute recovery; auditors never can | council-only key |
 
 ## Repository layout
 
 - `*.go` — core library: `timeline.go`/`graph.go` (trust chain), `watchdogs.go`
   /`detect.go`/`ensemble.go` (ensemble), `audit.go` (transparency), `council.go`
-  /`shamir.go` (threshold recovery), `rollback.go`/`consumer.go` (time travel),
-  `fleet.go`/`transport.go`/`mtls.go` (the mTLS wire), `identity.go` (real
-  X.509), `bench.go` (TrustOps)
+  /`shamir.go`/`councilnet.go` (threshold + networked recovery), `rollback.go`
+  /`consumer.go` (time travel), `fleet.go`/`transport.go`/`mtls.go` (the mTLS
+  wire), `identity.go` (real X.509 + CRL), `bench.go` (TrustOps)
 - `cmd/to/` — one CLI, three personalities (to-tool / to-bench / to-watchdog by
   basename): genkey, shard, enroll, revoke, bench, watchdog run
 - `cmd/orchestrator/`, `cmd/council/`, `cmd/auditor/` — daily-operation binaries
@@ -54,7 +54,7 @@ single machine deciding anything alone.
 - `docs/00-overview.md` … `docs/09-limitations.md` — self-contained reference
   (overview, architecture, requirements trace, component map, threat model,
   cryptography, workflow, testing, deployment, honest limitations)
-- `deploy/` — systemd units + `fleet-smoke.sh` live-fleet proof
+- `deploy/` — systemd units, `fleet-smoke.sh` live-fleet proof, `kubernetes.yaml`
 - `tools/` — tla2tools.jar pinned for the model check
 - `reports/` — regenerable evidence: benchmark, calibration, params, TLC log,
   kill-test log, canonical/evidence dumps
@@ -76,6 +76,7 @@ make model-check-mutations # P2/P6 mutation tests — TLC must report a violatio
 make kill-tests            # K1–K6 fault injection (chaos) suite → reports/kill-tests.log
 make fleet-smoke           # live fleet: 4 processes, real mTLS, healthy + DETECTED verdicts
 make build                 # 9 binaries; make build-linux → static linux/amd64 ELFs
+make docker-build          # container image (Dockerfile) for deploy/kubernetes.yaml
 ```
 
 Bootstrap + enrollment ceremony (one-time, offline / per node):
@@ -159,13 +160,18 @@ cd specs && java -jar ../tools/tla2tools.jar -workers 12 \
 - Every published number comes from `make benchmark` with parameters pinned in
   `bench.go` (one set for all scenarios); `reports/` contains the generated
   evidence and `reports/audit-round-2.md` the audit that produced them.
-- Formal properties P1–P6 are layered: TLA+ model check, Go invariant tests,
-  and a cross-checking council.
-- P5 (minimal blast) is asserted in Go (`InvalidationSet` + `VerifyRecovery`); the
-  TLA model covers P1/P2/P3/P4/P6.
+- Formal properties P1–P6 are layered: TLA+ model check (P1/P2/P3/P4/P6 and
+  P5's identity-scope via `P5MinimalBlast`), Go invariant tests, and a
+  cross-checking council.
+- P5's graph reachability (the per-window blast radius) is asserted in Go
+  (`InvalidationSet` + `VerifyRecovery`); the TLA model covers the scope
+  discipline and P1/P2/P3/P4/P6.
 - The network surface is exercised live, not just code-reviewed: `make
   fleet-smoke` runs four real processes over mTLS and asserts both a healthy
   and a DETECTED verdict (`fleet.go` + `TestMutualTLSRequest`).
+- CI (`.github/workflows/ci.yml`) re-runs vet, all tests, the kill suite, a
+  fuzz smoke pass on the three fuzz targets, the full benchmark with the
+  calibration-drift check, and a reduced-scale TLC run on every push.
 
 ## Full report
 
