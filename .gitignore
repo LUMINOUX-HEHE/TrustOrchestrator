@@ -17,3 +17,6 @@ scratch/
 # TLC state files
 states/
 specs/states/
+# sdk build artifacts
+*.class
+__pycache__/

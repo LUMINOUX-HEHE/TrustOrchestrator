@@ -113,7 +113,7 @@ machinery is what ships today.
 ## Kubernetes (guide §12)
 
 `Dockerfile` + `deploy/kubernetes.yaml`: one static image (scratch base,
-`CGO_ENABLED=0`, all 9 binaries in `/bin/`), zero OS-level trust — mTLS runs
+`CGO_ENABLED=0`, all 10 binaries in `/bin/`), zero OS-level trust — mTLS runs
 against the identity CA only.
 
 ```

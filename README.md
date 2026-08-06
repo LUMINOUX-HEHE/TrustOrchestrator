@@ -50,6 +50,10 @@ single machine deciding anything alone.
 - `cmd/orchestrator/`, `cmd/council/`, `cmd/auditor/` — daily-operation binaries
 - `cmd/identity/`, `cmd/pdp/` — consumers: workload-cert issuer + policy check
 - `cmd/dnsprobe/` — the W4 external-probe helper
+- `cmd/gateway/` — the management plane: REST API, RBAC, multi-tenancy,
+  webhooks, backup/restore, metrics, and the web dashboard (served at `/`)
+- `sdk/python/to_client.py`, `sdk/java/ToClient.java` — thin stdlib-only REST
+  clients; the Go SDK is the library itself + `Client` in the root package
 - `specs/` — TLA+ model, TLC configs, P2/P6 mutation tests
 - `docs/00-overview.md` … `docs/09-limitations.md` — self-contained reference
   (overview, architecture, requirements trace, component map, threat model,
@@ -75,7 +79,7 @@ make model-check           # TLC on specs/ (requires Java 21+), writes reports/t
 make model-check-mutations # P2/P6 mutation tests — TLC must report a violation
 make kill-tests            # K1–K6 fault injection (chaos) suite → reports/kill-tests.log
 make fleet-smoke           # live fleet: 4 processes, real mTLS, healthy + DETECTED verdicts
-make build                 # 9 binaries; make build-linux → static linux/amd64 ELFs
+make build                 # 10 binaries; make build-linux → static linux/amd64 ELFs
 make docker-build          # container image (Dockerfile) for deploy/kubernetes.yaml
 ```
 
@@ -172,6 +176,59 @@ cd specs && java -jar ../tools/tla2tools.jar -workers 12 \
 - CI (`.github/workflows/ci.yml`) re-runs vet, all tests, the kill suite, a
   fuzz smoke pass on the three fuzz targets, the full benchmark with the
   calibration-drift check, and a reduced-scale TLC run on every push.
+
+## Management plane (gateway)
+
+One binary, REST + RBAC + multi-tenant orgs + webhooks + backup/restore:
+
+```sh
+go run ./cmd/gateway -addr :8080 -data ./data   # first boot prints the admin token
+TOKEN=<printed-token>                            # Authorization: Bearer <token>
+
+curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8080/v1/orgs \
+     -d '{"name":"acme"}'                        # tenant -> {"id":"acme",...}
+curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8080/v1/users \
+     -d '{"id":"ops","role":"operator","orgs":["acme"]}'   # -> token (shown once)
+curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8080/v1/orgs/acme/issue \
+     -d '{"cert_id":"c1","identity":"user","via":"c0"}'
+curl -H "Authorization: Bearer $TOKEN" localhost:8080/v1/orgs/acme/state
+curl -H "Authorization: Bearer $TOKEN" localhost:8080/v1/audit?identity=user
+curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8080/v1/backup   # snapshot
+curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8080/v1/restore --data-binary @bundle.json
+curl -H "Authorization: Bearer $TOKEN" localhost:8080/v1/metrics           # prometheus text
+```
+
+Detection + recovery over the API: post watchdog scores to
+`/v1/orgs/{org}/scores` (≥3/5 below threshold → DETECTED event + webhooks),
+then `/v1/orgs/{org}/recover` with 3 of the 5 ceremony shards
+(`GET /v1/orgs/{org}/keys` → `to shard`). Roles: admin / operator / auditor /
+viewer; orgs field on a user scopes them to specific tenants. Full route
+table in `api.go`; end-to-end checks in `api_test.go`.
+
+Dashboard: open `http://localhost:8080/`, paste the token, manage orgs,
+issue/revoke/recover, audit search, webhooks, users, metrics, backup/restore —
+all in one static page, no build tooling.
+
+SDKs (thin REST clients over the same API):
+
+```go
+c := to.NewClient("http://localhost:8080", token)
+c.CreateOrg("acme", "")
+c.Issue("acme", "c1", "user", "c0")
+st, _ := c.State("acme")          // map[string]to.Cert
+```
+
+```python
+from to_client import TOClient
+c = TOClient("http://localhost:8080", token)
+c.create_org("acme"); c.issue("acme", "c1", "user"); print(c.state("acme"))
+```
+
+```java
+// java ToClient.java http://localhost:8080 <token>   (or use as a class)
+ToClient c = new ToClient("http://localhost:8080", token);
+c.createOrg("acme", ""); c.issue("acme", "c1", "user", ""); System.out.println(c.state("acme"));
+```
 
 ## Full report
 

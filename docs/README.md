@@ -17,6 +17,7 @@ and was verified live on 2026-08-02 (**45/45 tests pass, exit 0**).
 | [07-testing.md](07-testing.md) | Test inventory, reproduction commands, evidence files |
 | [08-deployment.md](08-deployment.md) | Binaries, commands, config, deployment layer status |
 | [09-limitations.md](09-limitations.md) | Honest list of what is and is not yet real |
+| [10-gateway.md](10-gateway.md) | REST API, dashboard, RBAC, multi-tenancy, webhooks, backup |
 
 ## Fifty-second summary
 

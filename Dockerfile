@@ -1,5 +1,5 @@
 # Trust Orchestrator container image (deployment guide §12 K8s).
-# One image, all 9 binaries in /bin/ — each Deployment picks its own
+# One image, all 10 binaries in /bin/ — each Deployment picks its own
 # entrypoint. Scratch base: the CLIs are static (CGO_ENABLED=0) and use only
 # the identity CA for mTLS, no OS cert bundle needed.
 # Build: make docker-build
@@ -16,7 +16,8 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/to-tool ./cmd/to \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/to-auditor ./cmd/auditor \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/to-identity ./cmd/identity \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/to-pdp ./cmd/pdp \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/to-dnsprobe ./cmd/dnsprobe
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/to-dnsprobe ./cmd/dnsprobe \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/to-gateway ./cmd/gateway
 
 FROM scratch
 COPY --from=build /out/ /bin/

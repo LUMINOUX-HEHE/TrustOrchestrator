@@ -1,0 +1,20 @@
+# to-gateway: REST API + dashboard + webhooks + backup (management plane).
+# State lives in /var/lib/trust-orchestrator (backup = copy the dir).
+# First boot prints the admin token to the journal (or seed TO_ADMIN_TOKEN).
+[Unit]
+Description=Trust Orchestrator gateway (REST API + dashboard)
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/to-gateway -addr 0.0.0.0:8080 -data /var/lib/trust-orchestrator
+Environment=TO_ADMIN_TOKEN=
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/trust-orchestrator
+StateDirectory=trust-orchestrator
+
+[Install]
+WantedBy=multi-user.target

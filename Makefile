@@ -21,8 +21,9 @@ build:
 	$(GO) build -o $(BIN)/to-identity ./cmd/identity
 	$(GO) build -o $(BIN)/to-pdp ./cmd/pdp
 	$(GO) build -o $(BIN)/to-dnsprobe ./cmd/dnsprobe
+	$(GO) build -o $(BIN)/to-gateway ./cmd/gateway    # REST API + dashboard (phase 2)
 
-# build-linux: cross-compile the same 9 binaries for linux/amd64 from any
+# build-linux: cross-compile the same 10 binaries for linux/amd64 from any
 # host. No cgo, stdlib-only crypto (Ed25519/TLS) — this target is the port
 # check: it must produce runnable linux ELFs without touching Linux. The
 # systemd units in deploy/ run exactly these binaries.
@@ -36,6 +37,7 @@ build-linux:
 	GOOS=$(GOOS_) GOARCH=$(GOARCH_) $(GO) build -o $(BIN)/linux/to-identity ./cmd/identity
 	GOOS=$(GOOS_) GOARCH=$(GOARCH_) $(GO) build -o $(BIN)/linux/to-pdp ./cmd/pdp
 	GOOS=$(GOOS_) GOARCH=$(GOARCH_) $(GO) build -o $(BIN)/linux/to-dnsprobe ./cmd/dnsprobe
+	GOOS=$(GOOS_) GOARCH=$(GOARCH_) $(GO) build -o $(BIN)/linux/to-gateway ./cmd/gateway
 
 # fleet-smoke: live-fleet proof — 4 real processes over mTLS on one host
 # (deploy/fleet-smoke.sh, deployment guide §5).
