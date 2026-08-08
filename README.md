@@ -146,7 +146,11 @@ go run ./cmd/council recover --evidence reports/evidence.json \
 
 Then POST the artifact to the gateway (below). The FROST shares come from
 `to-council dkg --members 5 --threshold 3 --out <dir>` (the root key never
-exists on this path).
+exists on this path). For a distrustful ceremony across member machines —
+no single machine ever holds the polynomial, each member ends with only its
+own share — run `to-council dkg-net` once per member (same `--peers` list,
+mTLS identity each; all members print the identical GROUP KEY, compared
+out-of-band).
 
 Daily operation:
 
@@ -214,6 +218,11 @@ go run ./cmd/gateway -addr :8080 -data ./data          # first boot prints the a
 go run ./cmd/gateway -addr :8443 -tls-cert c.pem -tls-key k.pem   # HTTPS termination
 go run ./cmd/gateway -council-pub <hex>                # recovery trust anchor (or TO_COUNCIL_PUB)
 go run ./cmd/gateway -leader-lock ./data/lock          # HA single-writer; second instance exits
+# envelope encryption, council-held KEK ("threshold-as-KMS"):
+go run ./cmd/to vaultkek --out etc/keys --shares 5 --threshold 3   # 3-of-5 wrap, KEK never on disk
+go run ./cmd/gateway -kek-shares etc/keys/kek-1.json,etc/keys/kek-2.json,etc/keys/kek-3.json -data ./data
+# post-compromise rotation (new DEK + epoch; old snapshots stop working):
+# POST /v1/rotate with {"shares":[3 Shard JSON files]} — see below
 TOKEN=<printed-token>                                  # Authorization: Bearer <token>
 
 curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8080/v1/orgs \
@@ -227,6 +236,9 @@ curl -H "Authorization: Bearer $TOKEN" localhost:8080/v1/audit?identity=user
 curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8080/v1/backup   # snapshot
 curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8080/v1/restore --data-binary @bundle.json
 curl -H "Authorization: Bearer $TOKEN" localhost:8080/v1/metrics           # prometheus text
+curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8080/v1/rotate \
+     -d '{"shares":[{"x":1,"y":123,"len":32},{"x":2,"y":456,"len":32},{"x":3,"y":789,"len":32}]}' \
+     # 3-of-5 KEK unwrap session -> new DEK + epoch; old DEK snapshots stop working (vault.go)
 # tokens can be org-scoped, and mutating calls can be idempotent:
 curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8080/v1/users/admin/tokens \
      -d '{"orgs":["acme"]}'                          # token limited to acme only

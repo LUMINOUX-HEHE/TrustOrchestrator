@@ -669,8 +669,31 @@ func (a *FrostAggregator) AddCommit(id string, de []byte) error {
 	return nil
 }
 
-// ComputeChallenge derives the aggregated nonce point R and the challenge
-// c = SHA512(R || A || m) from the message and ALL signer commitments. Any
+// aggregateNonce computes R = Σ_i (D_i + ρ_i·E_i) from the commitments —
+// the aggregated nonce point FROST and its blind variant both sign under.
+func aggregateNonce(groupPub ed25519.PublicKey, m []byte, commits map[string][]byte) (point, error) {
+	if len(commits) == 0 {
+		return identity, errors.New("frost: need commitments")
+	}
+	trans := &FrostTranscript{M: m, Commits: commits}
+	R := identity
+	for id, de := range commits {
+		D, err := decodePoint(de[:32])
+		if err != nil {
+			return identity, err
+		}
+		E, err := decodePoint(de[32:])
+		if err != nil {
+			return identity, err
+		}
+		rho := trans.bindingFactor(groupPub, id)
+		R = pointAdd(R, pointAdd(D, scalarMult(rho, E)))
+	}
+	return R, nil
+}
+
+// ComputeChallenge returns the aggregated nonce point R and the challenge
+// c = SHA512(R || A || m) from all signer commitments. Any
 // side can compute it; members use it to verify the aggregator's transcript
 // before revealing their partial signature (round 2 binds to round 1).
 // ponytail: binding factors hash the group key A, not each signer's A_i —
@@ -678,25 +701,22 @@ func (a *FrostAggregator) AddCommit(id string, de []byte) error {
 // partial is verified against ceremony-fixed pubshares anyway, so binding
 // to (A, m, sorted commits, id) is equivalent here.
 func ComputeChallenge(groupPub ed25519.PublicKey, m []byte, commits map[string][]byte) (r, c []byte, err error) {
-	if len(commits) == 0 {
-		return nil, nil, errors.New("frost: need commitments")
-	}
-	trans := &FrostTranscript{M: m, Commits: commits}
-	R := identity
-	for id, de := range commits {
-		D, err := decodePoint(de[:32])
-		if err != nil {
-			return nil, nil, err
-		}
-		E, err := decodePoint(de[32:])
-		if err != nil {
-			return nil, nil, err
-		}
-		rho := trans.bindingFactor(groupPub, id)
-		R = pointAdd(R, pointAdd(D, scalarMult(rho, E)))
+	R, err := aggregateNonce(groupPub, m, commits)
+	if err != nil {
+		return nil, nil, err
 	}
 	cc := hashToScalar(encode(R), groupPub, m)
 	return encode(R), scalarBytes(cc), nil
+}
+
+// UseBlindedChallenge takes over the challenge slot for a blind session
+// (blindfrost.go): the signers sign the blinded c' the user computed, R is
+// the blinded aggregate nonce R'. AddShare's per-partial verification and
+// Aggregate's final encoding then work unchanged.
+func (a *FrostAggregator) UseBlindedChallenge(cPrime []byte, Rp point, m []byte) {
+	a.c = new(big.Int).Mod(leToInt(cPrime), fl)
+	a.R = Rp
+	a.m = append([]byte(nil), m...)
 }
 
 // Challenge derives R and c from the collected commitments. All

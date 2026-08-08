@@ -1,5 +1,5 @@
 # Trust Orchestrator — make targets (deployment guide §3, §7, §10, §12).
-# Requires: Go 1.22+, Java 21+ (model check only).
+# Requires: Go 1.24+, Java 21+ (model check only).
 
 BIN      := bin
 GO       := go

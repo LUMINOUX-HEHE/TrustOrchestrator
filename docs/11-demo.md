@@ -25,7 +25,7 @@ It does, in order (the full ~2–3 min script):
 5. prints the admin token and the dashboard URL — the last act is you
    clicking "recover" on the dashboard (or via curl)
 
-Requirements: Go 1.22+, bash (Git Bash / WSL on Windows). Ports: 8333
+Requirements: Go 1.24+, bash (Git Bash / WSL on Windows). Ports: 8333
 (fleet), 8090 (gateway); port 8080 is in Windows' excluded range and
 bind fails silently — the script avoids it.
 

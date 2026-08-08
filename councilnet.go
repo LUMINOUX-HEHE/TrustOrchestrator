@@ -46,31 +46,49 @@ const (
 	councilVoteResp = "VOTE_RESP"
 	councilCommit   = "COMMIT_REQ"
 	councilCommitOk = "COMMIT_RESP"
+	councilPQHello  = "PQ_HELLO"
+	dkgExchange     = "DKG_EXCHANGE"
 )
+
+// pqWhen: post-quantum negotiation happens per connection. The client
+// opens mTLS, then announces a hybrid X25519‖ML-KEM-768 offer; the
+// member answers with its own public half plus a KEM ciphertext, and
+// from then on every frame is AES-256-GCM sealed under the derived
+// session key. Traffic captured today stays confidential even under a
+// quantum computer later (harvest-now-decrypt-later is defeated by the
+// ML-KEM half; PSD-203 anchor).
 
 // CouncilMsg is one length-prefixed JSON frame of the council wire.
 type CouncilMsg struct {
-	Kind          string          `json:"kind"`
-	Node          string          `json:"node"`
-	Epoch         int64           `json:"epoch,omitempty"`
-	Prev          int64           `json:"prev,omitempty"`
-	Root          []byte          `json:"root,omitempty"`
-	Payload       []byte          `json:"payload,omitempty"`
-	BadIndex      int             `json:"bad_index,omitempty"`
-	Timeline      json.RawMessage `json:"timeline,omitempty"`
-	Vote          bool            `json:"vote,omitempty"`
-	Checkpoint    []byte          `json:"checkpoint,omitempty"`
-	NewPub        []byte          `json:"new_pub,omitempty"`
-	Commit        []byte          `json:"commit,omitempty"`      // round 1: this member's D||E
+	Kind          string            `json:"kind"`
+	Node          string            `json:"node"`
+	Epoch         int64             `json:"epoch,omitempty"`
+	Prev          int64             `json:"prev,omitempty"`
+	Root          []byte            `json:"root,omitempty"`
+	Payload       []byte            `json:"payload,omitempty"`
+	BadIndex      int               `json:"bad_index,omitempty"`
+	Timeline      json.RawMessage   `json:"timeline,omitempty"`
+	Vote          bool              `json:"vote,omitempty"`
+	Checkpoint    []byte            `json:"checkpoint,omitempty"`
+	NewPub        []byte            `json:"new_pub,omitempty"`
+	Commit        []byte            `json:"commit,omitempty"`      // round 1: this member's D||E
 	Commitments   map[string][]byte `json:"commitments,omitempty"` // round 2: all members' D||E
-	R             []byte          `json:"r,omitempty"`           // round 2: aggregated nonce point
-	C             []byte          `json:"c,omitempty"`           // round 2: challenge
-	Frost         *FrostCommit    `json:"frost,omitempty"`       // round 2: handoff being signed
-	Share         []byte          `json:"share,omitempty"`       // round 2: partial signature
-	AffectedCerts []string        `json:"affected_certs,omitempty"`
-	AffectedIDs   []string        `json:"affected_ids,omitempty"`
-	Sig           []byte          `json:"sig,omitempty"`
-	Error         string          `json:"error,omitempty"`
+	R             []byte            `json:"r,omitempty"`           // round 2: aggregated nonce point
+	C             []byte            `json:"c,omitempty"`           // round 2: challenge
+	Frost         *FrostCommit      `json:"frost,omitempty"`       // round 2: handoff being signed
+	Share         []byte            `json:"share,omitempty"`       // round 2: partial signature
+	AffectedCerts []string          `json:"affected_certs,omitempty"`
+	AffectedIDs   []string          `json:"affected_ids,omitempty"`
+	Sig           []byte            `json:"sig,omitempty"`
+PQPub         *PQPublic         `json:"pq_pub,omitempty"`    // handshake: this side's hybrid public half
+	PQCipher      []byte            `json:"pq_cipher,omitempty"` // handshake: member's KEM ciphertext
+	PQSealed      []byte            `json:"pq_sealed,omitempty"` // sealed inner frame after handshake
+	Error         string            `json:"error,omitempty"`
+	// DKG (pairwise key generation, dkg.go):
+	Session  []byte   `json:"session,omitempty"`
+	From     string   `json:"from,omitempty"`
+	Commits  []string `json:"commits,omitempty"`  // hex commitment points C_0..C_{t-1}
+	ShareVal []byte   `json:"share_val,omitempty"` // hex scalar, f_i(j)
 }
 
 // CouncilMemberServer is one persistent council node: it answers VOTE and
@@ -78,15 +96,15 @@ type CouncilMsg struct {
 // vote; the partial signature only after the recovery post-conditions
 // re-verify AND the transcript challenge is recomputed locally.
 type CouncilMemberServer struct {
-	ID    string
-	Share *FrostSigner
-	key   ed25519.PrivateKey
-	cfg   *tls.Config
+	ID        string
+	Share     *FrostSigner
+	key       ed25519.PrivateKey
+	cfg       *tls.Config
 	epochPath string // persistence: last committed epoch (gap 5)
 
-	mu       sync.Mutex
-	epoch    int64 // last committed epoch (persisted)
-	pending  *pendingFrost // one in-flight FROST session
+	mu      sync.Mutex
+	epoch   int64         // last committed epoch (persisted)
+	pending *pendingFrost // one in-flight FROST session
 }
 
 type pendingFrost struct {
@@ -138,7 +156,20 @@ func (s *CouncilMemberServer) Serve(ln net.Listener) error {
 // handle serves one member connection (VOTE then COMMIT_REQ in order).
 func (s *CouncilMemberServer) handle(conn net.Conn) error {
 	defer conn.Close()
+	return serveFrames(conn, s.ID, s.dispatch)
+}
+
+// serveFrames runs the frame loop for one connection: an optional PQ_HELLO
+// hybrid handshake first, then every frame is dispatched and its response
+// written back — sealed with the session key once the handshake completed.
+// Shared by the council member server and the DKG nodes (dkg.go).
+// ponytail: legacy fallback answers plaintext after a PQ_HELLO only when
+// the peer replies with one (roundTripPQ); a silent peer is treated as
+// legacy by the initiator, not by this loop.
+func serveFrames(conn net.Conn, nodeID string, dispatch func(CouncilMsg) (CouncilMsg, error)) error {
 	r := bufio.NewReader(conn)
+	var sealed bool
+	var key []byte
 	for {
 		var hdr [4]byte
 		if _, err := io.ReadFull(r, hdr[:]); err != nil {
@@ -159,9 +190,51 @@ func (s *CouncilMemberServer) handle(conn net.Conn) error {
 		if err := json.Unmarshal(buf, &m); err != nil {
 			return err
 		}
-		resp, err := s.dispatch(m)
+		// First frame may open a PQ session.
+		if m.Kind == councilPQHello && !sealed {
+			if m.PQPub == nil {
+				return errors.New("councilnet: PQ_HELLO without public key")
+			}
+			mine, err := NewPQKeyPair()
+			if err != nil {
+				return err
+			}
+			ct, k, err := PQClientShared(mine, m.PQPub)
+			if err != nil {
+				return errors.New("councilnet: pq offer rejected: " + err.Error())
+			}
+			key = k
+			sealed = true
+			pub := mine.Public()
+			ack := CouncilMsg{Kind: councilPQHello, Node: nodeID, PQPub: &pub, PQCipher: ct}
+			if err := writeCouncilFrame(conn, ack); err != nil {
+				return err
+			}
+			continue
+		}
+		if sealed {
+			plain, err := pqOpen(key, m.PQSealed)
+			if err != nil {
+				return errors.New("councilnet: sealed frame rejected")
+			}
+			if err := json.Unmarshal(plain, &m); err != nil {
+				return err
+			}
+		}
+		resp, err := dispatch(m)
 		if err != nil {
 			return err
+		}
+		if sealed {
+			inner, _ := json.Marshal(resp)
+			body, err := pqSeal(key, inner)
+			if err != nil {
+				return err
+			}
+			if err := writeCouncilFrame(conn, CouncilMsg{PQSealed: body}); err != nil {
+				return err
+			}
+			continue
 		}
 		if err := writeCouncilFrame(conn, resp); err != nil {
 			return err
@@ -338,7 +411,7 @@ func RemoteRecover(tl *Timeline, evidence *TrustEvent, groupPub ed25519.PublicKe
 		if err != nil {
 			continue // unreachable member: no vote, no commitment (K3)
 		}
-		resp, err := roundTrip(member, CouncilMsg{Kind: councilVote, BadIndex: badIdx, Timeline: tlB})
+		resp, err := roundTripPQ(member, CouncilMsg{Kind: councilVote, BadIndex: badIdx, Timeline: tlB})
 		member.Close()
 		if err != nil || !resp.Vote || len(resp.Commit) != 64 {
 			continue // refused vote: honest member blocks bad evidence
@@ -401,7 +474,7 @@ func RemoteRecover(tl *Timeline, evidence *TrustEvent, groupPub ed25519.PublicKe
 		if err != nil {
 			continue
 		}
-		resp, err := roundTrip(member, req)
+		resp, err := roundTripPQ(member, req)
 		member.Close()
 		if err != nil || len(resp.Share) == 0 {
 			fmt.Printf("DEBUG round2 %s: err=%v respErr=%q\n", ep.ServerName, err, resp.Error)
@@ -528,6 +601,59 @@ func roundTrip(conn net.Conn, m CouncilMsg) (CouncilMsg, error) {
 	if err := writeCouncilFrame(conn, m); err != nil {
 		return CouncilMsg{}, err
 	}
+	return readCouncilFrame(conn)
+}
+
+// roundTripPQ negotiates a hybrid session on this fresh connection,
+// then sends one sealed frame and reads the sealed response. Callers
+// must pair it with dialCouncil and close the conn; when the member is
+// legacy (no PQ_HELLO support) it falls back to roundTrip.
+func roundTripPQ(conn net.Conn, m CouncilMsg) (CouncilMsg, error) {
+	mine, err := NewPQKeyPair()
+	if err != nil {
+		return CouncilMsg{}, err
+	}
+	pub := mine.Public()
+	if err := writeCouncilFrame(conn, CouncilMsg{Kind: councilPQHello, PQPub: &pub}); err != nil {
+		return CouncilMsg{}, err
+	}
+	ack, err := readCouncilFrame(conn)
+	if err != nil {
+		return CouncilMsg{}, err
+	}
+	if ack.PQPub == nil || len(ack.PQCipher) == 0 {
+		// Legacy member: reply plaintext (the frame the member expects).
+		return roundTrip(conn, m)
+	}
+	key, err := PQServerShared(mine, ack.PQPub, ack.PQCipher)
+	if err != nil {
+		return CouncilMsg{}, err
+	}
+	inner, _ := json.Marshal(m)
+	body, err := pqSeal(key, inner)
+	if err != nil {
+		return CouncilMsg{}, err
+	}
+	if err := writeCouncilFrame(conn, CouncilMsg{PQSealed: body}); err != nil {
+		return CouncilMsg{}, err
+	}
+	resp, err := readCouncilFrame(conn)
+	if err != nil {
+		return CouncilMsg{}, err
+	}
+	plain, err := pqOpen(key, resp.PQSealed)
+	if err != nil {
+		return CouncilMsg{}, err
+	}
+	var out CouncilMsg
+	if err := json.Unmarshal(plain, &out); err != nil {
+		return CouncilMsg{}, err
+	}
+	return out, nil
+}
+
+// readCouncilFrame reads one length-prefixed frame from the wire.
+func readCouncilFrame(conn net.Conn) (CouncilMsg, error) {
 	var hdr [4]byte
 	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
 		return CouncilMsg{}, err

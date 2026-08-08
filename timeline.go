@@ -63,6 +63,7 @@ type Timeline struct {
 	// private keys rotated away (one per recovery), so forks can continue
 	// under the key that was current at their branch point
 	rotations []rotKey
+	algo      hashAlgo // chain link digest algorithm (hash.go); sha256 default
 }
 
 type rotKey struct {
@@ -71,8 +72,27 @@ type rotKey struct {
 }
 
 func NewTimeline(key ed25519.PrivateKey) *Timeline {
+	return newTimeline(key, algoSHA256)
+}
+
+// NewDualTimeline creates a chain whose links are hashed with
+// SHA-256 ‖ SHA3-256 (hash agility). Legacy timelines stay on SHA-256 —
+// the format is self-describing via hash_algo, so both coexist.
+func NewDualTimeline(key ed25519.PrivateKey) *Timeline {
+	return newTimeline(key, algoDual)
+}
+
+func newTimeline(key ed25519.PrivateKey, algo hashAlgo) *Timeline {
 	pub := key.Public().(ed25519.PublicKey)
-	return &Timeline{key: key, pub: pub, start: pub}
+	return &Timeline{key: key, pub: pub, start: pub, algo: algo}
+}
+
+// HashAlgoName reports the chain's link-digest algorithm
+// ("" = SHA-256, "dual" = SHA-256 + SHA3-256).
+func (t *Timeline) HashAlgoName() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return algoNames[t.algo]
 }
 
 // Pub returns the current verification key (public).
@@ -93,7 +113,20 @@ func (t *Timeline) head() []byte {
 	if len(t.events) == 0 {
 		return nil
 	}
-	return t.events[len(t.events)-1].Hash()
+	return t.eventDigest(t.events[len(t.events)-1])
+}
+
+// eventDigest is an event's chain-link digest under the timeline's algo:
+// hash( canonical || signature ). SHA-256 mode is byte-identical to the
+// pre-agility format.
+func (t *Timeline) eventDigest(e TrustEvent) []byte {
+	return hashWith(t.algo, append(e.canonical(), e.Signature...))
+}
+
+// digestEvent is lock-free eventDigest for callers already inside t.mu
+// (watchdogs, audit).
+func (t *Timeline) digestEvent(e TrustEvent) []byte {
+	return t.eventDigest(e)
 }
 
 // Events exposes the chain for read-only consumers (auditors, operators).
@@ -210,14 +243,14 @@ func (t *Timeline) RotateKey(newKey ed25519.PrivateKey, ts int64) ([]byte, error
 // mid-chain. Returns the first bad index, or -1. A rotation event that
 // can't be parsed is treated as a chain break (it was signed by the old
 // key, so a malformed rotation is deliberate).
-func walkVerify(events []TrustEvent, startPub ed25519.PublicKey, councilPub ed25519.PublicKey, n int) int {
+func walkVerify(events []TrustEvent, startPub ed25519.PublicKey, councilPub ed25519.PublicKey, algo hashAlgo, n int) int {
 	pub := startPub
 	for i := 0; i < n; i++ {
 		e := events[i]
 		if i == 0 && e.ParentHash != nil {
 			return i
 		}
-		if i > 0 && !bytes.Equal(e.ParentHash, events[i-1].Hash()) {
+		if i > 0 && !bytes.Equal(e.ParentHash, hashWith(algo, append(events[i-1].canonical(), events[i-1].Signature...))) {
 			return i
 		}
 		if e.Type == EvRecovery {
@@ -231,7 +264,7 @@ func walkVerify(events []TrustEvent, startPub ed25519.PublicKey, councilPub ed25
 			// the handoff must reference the exact chain head before it
 			var want []byte
 			if i > 0 {
-				want = events[i-1].Hash()
+				want = hashWith(algo, append(events[i-1].canonical(), events[i-1].Signature...))
 			}
 			if !bytes.Equal(fc.Checkpoint, want) {
 				return i
@@ -268,7 +301,7 @@ func (t *Timeline) VerifyPrefix(n int) bool {
 	if n > len(t.events) {
 		n = len(t.events)
 	}
-	return walkVerify(t.events, t.startPub(), t.councilPub, n) == -1
+	return walkVerify(t.events, t.startPub(), t.councilPub, t.algo, n) == -1
 }
 
 // LocateBadEvent returns the index of the first event that breaks the chain
@@ -280,7 +313,7 @@ func (t *Timeline) LocateBadEvent() int {
 }
 
 func (t *Timeline) locateBadEvent() int {
-	return walkVerify(t.events, t.startPub(), t.councilPub, len(t.events))
+	return walkVerify(t.events, t.startPub(), t.councilPub, t.algo, len(t.events))
 }
 
 // pubForPrefix returns the verification key current after events[0..idx]
@@ -322,7 +355,7 @@ func (t *Timeline) Fork(atHash []byte) (*Timeline, error) {
 		return nil, fmt.Errorf("checkpoint %x not in timeline", atHash)
 	}
 	f := &Timeline{key: t.keyAt(idx), start: pubForPrefix(t.events, t.startPub(), idx),
-		councilPub: t.councilPub}
+		councilPub: t.councilPub, algo: t.algo}
 	f.pub = f.start
 	f.events = append(f.events, t.events[:idx+1]...)
 	return f, nil
@@ -362,6 +395,7 @@ type timelineFile struct {
 	StartPub   ed25519.PublicKey  `json:"start_pub,omitempty"` // key at event[0]; missing = Pub
 	CouncilPub ed25519.PublicKey  `json:"council_pub,omitempty"`
 	Key        ed25519.PrivateKey `json:"key,omitempty"` // demo/evidence only; production dumps omit it
+	HashAlgo   string             `json:"hash_algo,omitempty"` // "" | "dual"; empty = legacy SHA-256
 }
 
 // Save persists the timeline (events + verification key). The signing key
@@ -380,6 +414,9 @@ func (t *Timeline) Marshal(includeKey bool) ([]byte, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	f := timelineFile{Events: t.events, Pub: t.pub}
+	if t.algo != algoSHA256 {
+		f.HashAlgo = algoNames[t.algo]
+	}
 	if t.start != nil {
 		f.StartPub = t.start
 	}
@@ -431,7 +468,11 @@ func UnmarshalTimeline(b []byte) (*Timeline, error) {
 	if len(f.CouncilPub) == ed25519.PublicKeySize {
 		council = f.CouncilPub
 	}
-	return &Timeline{events: f.Events, pub: f.Pub, start: start, councilPub: council, key: f.Key}, nil
+	algo, ok := algoCodes[f.HashAlgo]
+	if !ok {
+		return nil, fmt.Errorf("timeline: unknown hash_algo %q", f.HashAlgo)
+	}
+	return &Timeline{events: f.Events, pub: f.Pub, start: start, councilPub: council, key: f.Key, algo: algo}, nil
 }
 
 type Cert struct {

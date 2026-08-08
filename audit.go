@@ -1,6 +1,7 @@
 package trustorchestrator
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 )
@@ -12,6 +13,12 @@ import (
 type AuditorLog struct {
 	events []TrustEvent
 	head   []byte
+	algo   hashAlgo // link-digest algorithm; must match the mirrored timeline
+}
+
+// NewAuditorLog mirrors a chain built under the given link algorithm.
+func NewAuditorLog(algo hashAlgo) *AuditorLog {
+	return &AuditorLog{algo: algo}
 }
 
 func (a *AuditorLog) Mirror(e TrustEvent) {
@@ -24,7 +31,7 @@ func (a *AuditorLog) Verify() bool {
 		if i == 0 && e.ParentHash != nil {
 			return false
 		}
-		if i > 0 && string(e.ParentHash) != string(a.events[i-1].Hash()) {
+		if i > 0 && !bytes.Equal(e.ParentHash, hashWith(a.algo, append(a.events[i-1].canonical(), a.events[i-1].Signature...))) {
 			return false
 		}
 	}

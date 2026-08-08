@@ -16,6 +16,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 
 	to "trustorchestrator"
@@ -35,6 +37,8 @@ func main() {
 	switch args[0] {
 	case "dkg":
 		err = dkgCmd(args[1:])
+	case "dkg-net":
+		err = dkgNetCmd(args[1:])
 	case "recover":
 		err = recoverCmd(args[1:])
 	case "serve":
@@ -54,6 +58,13 @@ func usage() {
     one-time ceremony: writes share-1.json..share-n.json (FROST shares;
     the root never exists) and prints the council group key (the gateway's
     recovery trust anchor)
+  to-council dkg-net --me <M1> --addr <host:port> --members <n> --threshold <k>
+      --out <dir> --ca <ca.der> --cert <leaf.der> --key <node.key>
+      --peers M1:host1:p1,M2:host2:p2,...
+    distrustful ceremony, ONE PROCESS PER MEMBER MACHINE: pairwise,
+    no coordinator — every member ends with only its own share file and
+    the same group key; no single actor ever holds a polynomial. Run
+    this command on all n machines with the same --peers list.
   to-council serve --id <C1> --addr <host:port> --share <s.json> --epoch <f> --ca <ca.der> --cert <leaf.der> --key <node.key>
     persistent networked member: answers VOTE (commitment only on clean
     prefix) and COMMIT_REQ (partial signature only after P3/P5 re-check)
@@ -140,6 +151,95 @@ func loadShare(path string) (*to.FrostSigner, error) {
 	return s, nil
 }
 
+// memberTLS loads the mTLS identity shared by serve and dkg-net; the leaf
+// key is also the member's node signing key.
+func memberTLS(f map[string]string) (ed25519.PrivateKey, *tls.Config, error) {
+	raw, err := os.ReadFile(f["key"])
+	if err != nil {
+		return nil, nil, err
+	}
+	seed, err := hex.DecodeString(strings.TrimSpace(string(raw)))
+	if err != nil {
+		return nil, nil, err
+	}
+	key := keyFromFile(seed)
+	caDER, err := os.ReadFile(f["ca"])
+	if err != nil {
+		return nil, nil, err
+	}
+	leaf, err := os.ReadFile(f["cert"])
+	if err != nil {
+		return nil, nil, err
+	}
+	cfg, err := to.MutualTLSConfig(caDER, leaf, key)
+	return key, cfg, err
+}
+
+// dkgNetCmd runs one member of a distrustful pairwise DKG ceremony: every
+// member runs this on its own machine with the same --peers list. Each
+// process keeps ONLY its own share; the group key must match across all
+// members — every operator compares it out-of-band.
+func dkgNetCmd(args []string) error {
+	f := flags(args)
+	for _, k := range []string{"me", "members", "threshold", "out", "ca", "cert", "key", "peers"} {
+		if f[k] == "" {
+			return errors.New("usage: dkg-net --me <M1> --members <n> --threshold <k> --out <dir> --ca <ca.der> --cert <leaf.der> --key <node.key> --peers M1:host:p1,M2:host:p2,...")
+		}
+	}
+	n, err := strconv.Atoi(f["members"])
+	if err != nil {
+		return err
+	}
+	t, err := strconv.Atoi(f["threshold"])
+	if err != nil {
+		return err
+	}
+	peers := map[string]string{}
+	for _, p := range strings.Split(f["peers"], ",") {
+		ps := strings.SplitN(p, ":", 2)
+		if len(ps) != 2 {
+			return errors.New("bad --peers entry: " + p)
+		}
+		peers[ps[0]] = ps[1]
+	}
+	if len(peers) != n {
+		return fmt.Errorf("--members %d != %d peers", n, len(peers))
+	}
+	_, cfg, err := memberTLS(f)
+	if err != nil {
+		return err
+	}
+	node, err := to.NewDkgNode(f["me"], f["addr"], n, t, cfg, peers)
+	if err != nil {
+		return err
+	}
+	ln, err := tls.Listen("tcp", f["addr"], cfg)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("dkg member %s on %s: pairwise ceremony with %d members...\n", f["me"], f["addr"], n)
+	group, err := node.RunOn(ln)
+	if err != nil {
+		return err
+	}
+	s := node.Signer()
+	file := to.FrostShareFile{
+		ID: f["me"], GroupPub: group,
+		X: s.X, Y: s.Share, PubShare: s.PubShare, GlobalVK: s.GlobalVK,
+	}
+	b, err := json.MarshalIndent(file, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(f["out"], f["me"]+".json")
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		return err
+	}
+	fmt.Printf("share file written to %s\n", path)
+	fmt.Printf("GROUP KEY (verify identical on all %d members):\n%s\n", n, hex.EncodeToString(group))
+	return nil
+}
+
 // serveCmd runs one council member node: mTLS listener, one FROST share,
 // node key from `to-identity issue --key-out` (64-byte hex) or a 32-byte
 // seed.
@@ -154,24 +254,7 @@ func serveCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	raw, err := os.ReadFile(f["key"])
-	if err != nil {
-		return err
-	}
-	seed, err := hex.DecodeString(strings.TrimSpace(string(raw)))
-	if err != nil {
-		return err
-	}
-	key := keyFromFile(seed)
-	caDER, err := os.ReadFile(f["ca"])
-	if err != nil {
-		return err
-	}
-	leaf, err := os.ReadFile(f["cert"])
-	if err != nil {
-		return err
-	}
-	cfg, err := to.MutualTLSConfig(caDER, leaf, key)
+	key, cfg, err := memberTLS(f)
 	if err != nil {
 		return err
 	}

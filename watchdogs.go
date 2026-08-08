@@ -154,7 +154,7 @@ func (w *Watchdog) computeScore() Score {
 		} else {
 			for i := w.checked; i < len(w.tl.events); i++ {
 				e := w.tl.events[i]
-				if i > 0 && !bytes.Equal(e.ParentHash, w.tl.events[i-1].Hash()) {
+				if i > 0 && !bytes.Equal(e.ParentHash, w.tl.digestEvent(w.tl.events[i-1])) {
 					bad = i
 					break
 				}

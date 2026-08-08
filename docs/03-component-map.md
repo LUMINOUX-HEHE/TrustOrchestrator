@@ -30,7 +30,7 @@ Every source file, its job, key functions, and how it's tested.
 |---|---|---|
 | `cmd/to` | `to-tool` (base: genkey,shard,enroll,bench) + `to-bench` + `to-watchdog` (enroll/run) | the Swiss-army CLI, dispatch by argv[0] |
 | `cmd/orchestrator` | `to-orchestrator status / timeline / verify / graph / policy reload / rollback --dry-run` | reads event files |
-| `cmd/council` | `to-council serve` (networked member node) + `recover` (share files) | member node: FROST share + mTLS; recover: share files |
+| `cmd/council` | `to-council serve` (networked member node) + `recover` (share files) + `dkg` / `dkg-net` (ceremonies: in-process vs. distrustful pairwise over mTLS) | member node: FROST share + mTLS; recover: share files |
 | `cmd/auditor` | `to-auditor audit --log` | mirror log checker |
 | `cmd/identity` | `to-identity ca / issue / revoke / crl / verify` | CA + CRL issuance, revocation, inspection |
 | `cmd/pdp` | `to-pdp check --policy --events` | policy decision point |
