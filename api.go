@@ -113,6 +113,7 @@ func (s *Store) Handler() http.Handler {
 	s.route(mux, "POST /v1/backup", []string{RoleAdmin}, false, s.handleBackup)
 	s.route(mux, "GET /v1/backup/{id}/download", []string{RoleAdmin}, false, s.handleBackupDownload)
 	s.route(mux, "POST /v1/restore", []string{RoleAdmin}, false, s.handleRestore)
+	s.route(mux, "POST /v1/rotate", []string{RoleAdmin}, false, s.handleRotate)
 	s.route(mux, "GET /v1/metrics", []string{RoleViewer, RoleAuditor, RoleOperator, RoleAdmin}, false, s.handleMetrics)
 	return mux
 }
@@ -876,6 +877,34 @@ func (s *Store) handleRestore(w http.ResponseWriter, r *http.Request, t *Tenant)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"restored": true})
+}
+
+// handleRotate is the post-compromise key rotation over the API: the
+// request body carries the council's KEK share (a 3-of-5 unwrap session as
+// with the -kek-shares boot flag), RotateVault bumps the DEK + epoch and
+// re-wraps every tenant. Old DEK snapshots stop working the moment this
+// returns.
+func (s *Store) handleRotate(w http.ResponseWriter, r *http.Request, t *Tenant) {
+	var body struct {
+		Shares []Shard `json:"shares"`
+	}
+	dec := json.NewDecoder(io.LimitReader(r.Body, maxBody))
+if err := dec.Decode(&body); err != nil || len(body.Shares) == 0 {
+		writeErr(w, http.StatusBadRequest, errors.New("rotate: body needs {\"shares\": [3 or more Shard JSON files]}"))
+		return
+	}
+	shares := make([]*Shard, len(body.Shares))
+	for i := range body.Shares {
+		shares[i] = &body.Shares[i]
+	}
+	if err := s.RotateVault(shares); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	s.mu.Lock()
+	epoch := s.vault.Epoch
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"rotated": true, "epoch": epoch})
 }
 
 func (s *Store) handleMetrics(w http.ResponseWriter, r *http.Request, t *Tenant) {

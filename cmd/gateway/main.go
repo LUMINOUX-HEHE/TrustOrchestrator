@@ -13,6 +13,7 @@ import (
 	"crypto/ed25519"
 	"embed"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -35,6 +36,7 @@ func main() {
 	tlsKey := flag.String("tls-key", "", "server private key")
 	council := flag.String("council-pub", os.Getenv("TO_COUNCIL_PUB"), "hex council FROST group key — recovery trust anchor")
 	lock := flag.String("leader-lock", "", "peer file: HA single-writer lease (second gateway exits)")
+	kekShares := flag.String("kek-shares", "", "council KEK share files, comma-separated — 3-of-5 threshold unwrap for gateway.keys (envelope encryption, vault.go)")
 	flag.Parse()
 
 	if (*tlsCert == "") != (*tlsKey == "") {
@@ -48,6 +50,16 @@ func main() {
 	gw, raw, err := to.NewGateway(*data, *token)
 	if err != nil {
 		log.Fatalf("gateway: %v", err)
+	}
+	if *kekShares != "" {
+		shares, err := loadShares(*kekShares)
+		if err != nil {
+			log.Fatalf("gateway: kek-shares: %v", err)
+		}
+		if err := gw.UnlockVault(shares); err != nil {
+			log.Fatalf("gateway: vault unwrap: %v", err)
+		}
+		log.Printf("vault: envelope encryption active (council KEK, unwrapped by %d share files)", len(shares))
 	}
 	if *council != "" {
 		pub, err := hex2key(*council)
@@ -91,6 +103,30 @@ func hex2key(s string) (ed25519.PublicKey, error) {
 		return nil, fmt.Errorf("want %d bytes, got %d", ed25519.PublicKeySize, len(b))
 	}
 	return ed25519.PublicKey(b), nil
+}
+
+// loadShares reads the council KEK share files (Shard JSON, one per member).
+func loadShares(list string) ([]*to.Shard, error) {
+	var shares []*to.Shard
+	for _, f := range strings.Split(list, ",") {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			continue
+		}
+		b, err := os.ReadFile(f)
+		if err != nil {
+			return nil, err
+		}
+		var sh to.Shard
+		if err := json.Unmarshal(b, &sh); err != nil {
+			return nil, fmt.Errorf("%s: %w", f, err)
+		}
+		shares = append(shares, &sh)
+	}
+	if len(shares) == 0 {
+		return nil, fmt.Errorf("no share files given")
+	}
+	return shares, nil
 }
 
 // newHandler mounts the dashboard at / and the REST API everywhere else.

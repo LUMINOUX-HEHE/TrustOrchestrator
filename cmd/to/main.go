@@ -37,6 +37,8 @@ func main() {
 		err = genKey(os.Args[2])
 	case "shard":
 		err = shard(args[1:])
+	case "vaultkek":
+		err = vaultkek(args[1:])
 	case "enroll":
 		err = enroll(args[1:])
 	case "revoke":
@@ -75,6 +77,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   to-tool genkey <file>
   to-tool shard <keyfile> <n> <k>          | shard --key <f> --shares <n> --threshold <k>
+  to-tool vaultkek --out <dir> [--shares 5 --threshold 3] [--keep]
   to-tool enroll --bootstrap <keyfile> --config <config.yaml>
   to-tool revoke --bootstrap <keyfile>    # FR8.2: one-time bootstrap, then spent
   to-tool bench [run] [--out <dir>] [--scenario all] [--log <file>]
@@ -282,6 +285,65 @@ func shard(args []string) error {
 	}
 	fmt.Printf("wrote %d FROST shares (threshold %d of %d) to share-*.json\n", n, k, n)
 	fmt.Printf("GROUP KEY (gateway --council-pub): %s\n", hex.EncodeToString(groupPub))
+	return nil
+}
+
+// vaultkek mints the council key-encryption key (KEK) for the gateway's
+// envelope encryption: a random 32-byte key split into n Shamir shares,
+// k of which are the boot unwrap session (gateway --kek-shares). The KEK
+// itself is written only when --keep-kek is given — after distributing the
+// shares, delete it; the council is from then on the only key-holder.
+func vaultkek(args []string) error {
+	out, n, k, keep := "vault", 5, 3, false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--out":
+			if i+1 < len(args) {
+				out = args[i+1]
+				i++
+			}
+		case "--shares":
+			if i+1 < len(args) {
+				n, _ = strconv.Atoi(args[i+1])
+				i++
+			}
+		case "--threshold":
+			if i+1 < len(args) {
+				k, _ = strconv.Atoi(args[i+1])
+				i++
+			}
+		case "--keep":
+			keep = true
+		}
+	}
+	kek := make([]byte, 32)
+	if _, err := rand.Read(kek); err != nil {
+		return err
+	}
+	shares, err := to.ShareKEK(kek, n, k)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(out, 0o700); err != nil {
+		return err
+	}
+	for i, s := range shares {
+		b, err := s.Marshal()
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(out, fmt.Sprintf("kek-%d.json", i+1)), b, 0o600); err != nil {
+			return err
+		}
+	}
+	if keep {
+		if err := os.WriteFile(filepath.Join(out, "kek.json"), []byte(hex.EncodeToString(kek)), 0o600); err != nil {
+			return err
+		}
+		fmt.Printf("wrote KEK + %d shares (threshold %d of %d) to %s\n", n, k, n, out)
+	} else {
+		fmt.Printf("wrote %d KEK shares (threshold %d of %d) to %s — KEK never hit disk; any %d open gateway.keys\n", n, k, n, out, k)
+	}
 	return nil
 }
 

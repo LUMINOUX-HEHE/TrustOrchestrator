@@ -67,6 +67,7 @@ type Store struct {
 	mu         sync.Mutex
 	dir        string
 	sealKey    []byte             // 32-byte AES key; zero when disabled (legacy dirs)
+	vault      *Vault             // envelope encryption (vault.go); nil = legacy v1/plaintext
 	Users      map[string]*User   `json:"users"`
 	Webhooks   []*Webhook         `json:"webhooks"`
 	Tenants    map[string]*Tenant `json:"tenants"`
@@ -123,6 +124,14 @@ func NewStore(dir string) (*Store, error) {
 		for id := range s.Tenants {
 			tl, err := s.loadTenantTimeline(id)
 			if err != nil {
+				// vault-sealed file with no unlocked vault: defer the tenant
+				// to UnlockVault (the -kek-shares session) instead of dying —
+				// the files stay unreadable until the shares arrive.
+				if errors.Is(err, errVaultUnlocked) {
+					s.Tenants[id].fleet = NewFleet(threshold, quorum, 0) // keep watchOrg wired; feed scores after unlock
+					s.Tenants[id].counters = map[string]int64{}
+					continue
+				}
 				return nil, fmt.Errorf("store: tenant %s: %w", id, err)
 			}
 			if len(s.CouncilPub) == ed25519.PublicKeySize && len(tl.CouncilPub()) == 0 {
@@ -138,11 +147,25 @@ func NewStore(dir string) (*Store, error) {
 	return s, nil
 }
 
+var errVaultUnlocked = errors.New("store: tenant is vault-sealed but no vault is unlocked (start the gateway with -kek-shares)")
+
 // loadTenantTimeline reads one tenant's timeline file, sealed or legacy.
+// v2 (vaultMagic) files require an unlocked vault; errVaultUnlocked is how
+// a boot without the 3-of-5 session defers, never silently guessing.
 func (s *Store) loadTenantTimeline(id string) (*Timeline, error) {
 	b, err := os.ReadFile(filepath.Join(s.dir, "tenants", id, "timeline.json"))
 	if err != nil {
 		return nil, err
+	}
+	if bytes.HasPrefix(b, []byte(vaultMagic)) {
+		if s.vault == nil {
+			return nil, errVaultUnlocked
+		}
+		raw, err := s.vault.Open(id, b)
+		if err != nil {
+			return nil, fmt.Errorf("store: vault open: %w", err)
+		}
+		return UnmarshalTimeline(raw)
 	}
 	if !bytes.HasPrefix(b, []byte(encMagic)) {
 		return UnmarshalTimeline(b) // legacy plaintext
@@ -213,7 +236,18 @@ func (s *Store) saveTenant(t *Tenant) error {
 	if err != nil {
 		return err
 	}
-	if len(s.sealKey) == 32 {
+	return s.saveTenantBlob(t, b)
+}
+
+// saveTenantBlob writes one tenant timeline, sealed under the vault when
+// enabled, else the legacy v1 seal key (or plaintext when neither exists).
+func (s *Store) saveTenantBlob(t *Tenant, b []byte) error {
+	var err error
+	if s.vault != nil {
+		if b, err = s.vault.Seal(t.ID, b); err != nil {
+			return err
+		}
+	} else if len(s.sealKey) == 32 {
 		if b, err = seal(s.sealKey, b); err != nil {
 			return err
 		}
@@ -343,6 +377,7 @@ func (s *Store) Restore(b []byte) error {
 	gw := bundle.Gateway
 	gw.dir = s.dir
 	gw.sealKey = append([]byte(nil), s.sealKey...) // re-encrypt under our key
+	gw.vault = s.vault                              // or under our vault envelope
 	gw.started = time.Now()
 	nt := map[string]*Tenant{}
 	for id, raw := range bundle.Tenants {
@@ -376,5 +411,107 @@ func (s *Store) Restore(b []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Users, s.Webhooks, s.Tenants = gw.Users, gw.Webhooks, gw.Tenants
+	return nil
+}
+
+// UnlockVault is the boot unwrap session (threshold-as-KMS): ≥3 council
+// shares reconstruct the KEK, which unseals gateway.keys into the live
+// vault. First boot on an unkeyed/legacy store: mints a fresh vault, seals
+// it, and re-encodes every tenant under it. The KEK lives only in this
+// stack frame (zeroBytes). After this, stores run with envelope encryption.
+func (s *Store) UnlockVault(shares []*Shard) error {
+	kek, err := JoinKEK(shares)
+	if err != nil {
+		return fmt.Errorf("vault: unwrap session: %w", err)
+	}
+	defer zeroBytes(kek)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keysPath := filepath.Join(s.dir, "gateway.keys")
+	v, err := readVaultKeyFile(keysPath, kek)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if v == nil {
+		if v, err = NewVault(); err != nil {
+			return err
+		}
+		if err := writeVaultKeyFile(keysPath, kek, v); err != nil {
+			return err
+		}
+	}
+	s.vault = v
+	if err := s.loadVaultedTenants(); err != nil { // boot-deferred tenants (vault-sealed at NewStore)
+		return err
+	}
+	return s.reSealAllTenants() // upgrade any legacy v1/plaintext files
+}
+
+// RotateVault is the post-compromise rotation: with the council's KEK back
+// in a fresh unwrap session, a new DEK + epoch are sealed and every tenant
+// file is re-sealed. Pre-rotation snapshots — DEK or tenant files — cannot
+// open anything written afterwards: the leak survives only until the next
+// rotation it missed. Payload data is re-wrapped in place, not re-encrypted
+// (v1 → v2 upgrade comes with UnlockVault).
+func (s *Store) RotateVault(shares []*Shard) error {
+	kek, err := JoinKEK(shares)
+	if err != nil {
+		return fmt.Errorf("vault: unwrap session: %w", err)
+	}
+	defer zeroBytes(kek)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.vault == nil {
+		return errors.New("vault: no active vault (gateway booted without -kek-shares)")
+	}
+	nv, err := NewVault()
+	if err != nil {
+		return err
+	}
+	nv.Epoch = s.vault.Epoch + 1
+	if err := writeVaultKeyFile(filepath.Join(s.dir, "gateway.keys"), kek, nv); err != nil {
+		return err
+	}
+	s.vault = nv
+	if err := s.loadVaultedTenants(); err != nil {
+		return err
+	}
+	return s.reSealAllTenants()
+}
+
+// loadVaultedTenants hydrates tenants that NewStore deferred (vault-sealed
+// file, no shares at boot): they become live once the vault is unlocked.
+func (s *Store) loadVaultedTenants() error {
+	for id := range s.Tenants {
+		t := s.Tenants[id]
+		if t.tl != nil {
+			continue
+		}
+		tl, err := s.loadTenantTimeline(id)
+		if err != nil {
+			return fmt.Errorf("store: tenant %s (vault): %w", id, err)
+		}
+		if len(s.CouncilPub) == ed25519.PublicKeySize && len(tl.CouncilPub()) == 0 {
+			tl.SetCouncilPub(s.CouncilPub)
+		}
+		t.tl = tl
+		t.fleet = NewFleet(threshold, quorum, 0)
+		t.counters = map[string]int64{}
+	}
+	return nil
+}
+
+// reSealAllTenants re-encodes every tenant file under the current vault:
+// on Unlock it upgrades v1/plaintext, on Rotate it re-seals with fresh
+// epoch keys. Reads from the in-memory timelines, so no old-format reads.
+func (s *Store) reSealAllTenants() error {
+	if s.vault == nil {
+		return nil
+	}
+	for _, t := range s.Tenants {
+		if err := s.saveTenant(t); err != nil {
+			return err
+		}
+	}
 	return nil
 }
