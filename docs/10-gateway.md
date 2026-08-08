@@ -1,4 +1,4 @@
-# 10 — Gateway: REST API, dashboard, RBAC, webhooks, backup
+# 10 — Gateway: REST API, dashboard, RBAC, webhooks, backup, transparency
 
 The gateway (`cmd/gateway`, binary `to-gateway`) is the management plane over
 the engine: a REST API with role-based access, multi-tenant orgs (logical
@@ -10,7 +10,7 @@ One binary, one process, zero third-party dependencies.
 
 ```
 data/
-  gateway.json                  users, webhooks, tenant meta, council anchor
+  gateway.json                  users, webhooks, tenant meta, council anchor, CT log key
   gateway.key                   AES key sealing tenant timelines (0600, at rest)
   outbox.json                   pending webhook deliveries (durable queue)
   tenants/<org>/timeline.json   per-org signed trust chain (AES-GCM sealed)
@@ -99,6 +99,47 @@ enforced identically on both paths.
 recovery counters + uptime/users/orgs. The dashboard renders org cards and
 the raw text.
 
+## Transparency (RFC 9162)
+
+Every org exposes an append-only **transparency log** (`ctlog.go`): the
+RFC 9162 Merkle tree whose leaves are the hashes of the org's signed
+timeline events, in append order. The tree is rebuilt from the timeline on
+demand — the log derives from the same signatures the chain already
+carries, so there is no second trusted writer. The log's signing key
+(`log_key`, an Ed25519 seed) is generated at first boot and stored in
+`gateway.json`.
+
+| Endpoint | Roles | Returns |
+|---|---|---|
+| `GET /v1/orgs/{org}/ct/sth` | viewer+ | signed tree head: `tree_size`, `timestamp`, `root_hex`, `signature_hex`, `log_key_hex` |
+| `GET /v1/orgs/{org}/ct/proof?index=&size=` | viewer+ | inclusion proof of leaf `index` in the tree at `size`: `leaf_hash_hex`, `root_hex`, `proof` (hex siblings, bottom-up) |
+| `GET /v1/orgs/{org}/ct/proof?from=&to=` | viewer+ | consistency proof between two sizes: `old_root_hex`, `new_root_hex`, `proof` |
+| `POST /v1/orgs/{org}/ct/gossip` | viewer+ | cross-check an observed STH: `accepted`, `alarm`, `trusted_tree_size`, `trusted_root_hex` |
+
+The **audit loop** needs no trust in the gateway:
+
+1. Read the STH (size *n*, signed root *r*), and the org's log key.
+2. Fetch any proof and verify it by hand: `VerifyInclusion(leaf, idx,
+   size, proof)` must recompute that size's root, `VerifyConsistency(oldRoot,
+   newRoot, from, to, proof)` must hold — both are pure, public library
+   functions (RFC 9162 §2.1.3.2 / §2.1.4.2).
+3. A newer STH must extend the older one: replay its consistency proof
+   against the trusted head. A root that changes at the *same* size is a
+   split-brain — a rewrite — and gossip raises the alarm.
+
+`POST /v1/orgs/{org}/ct/gossip` is the verifier surface: submit an STH you
+observed (signed, base64 root/signature, plus the consistency proof from
+your trusted size). The gateway verifies the signature against its log key,
+anchors on the first valid STH it has seen, and thereafter accepts a head
+only if it consistently extends the trusted one — a rewrite or a wrong
+proof answers `accepted:false` with the reason in `alarm`. The gateway's
+own `/ct/sth` is served from the same log, so two instances observing each
+other's heads cross-check both directions.
+
+`client.go` wraps the whole surface: `CTSTH`, `CTInclusionProof`,
+`CTConsistencyProof`, `CTGossip` (see `TestClientCTAudit` for the full
+audit loop end-to-end).
+
 ## Rate limiting
 
 Every request is budgeted by a **token bucket keyed on the token identity**
@@ -134,7 +175,9 @@ throttle (there is no unthrottled code path).
 
 `api_test.go` (root package): auth/RBAC, org lifecycle, detection →
 webhook, token scoping, idempotency, durable outbox, council recovery via
-API fork+commit, backup/restore round-trip, tampered-bundle rejection.
+API fork+commit, backup/restore round-trip, tampered-bundle rejection, CT
+STH/proof/gossip end-to-end (`TestCTEndpoints`).
 `ratelimit_test.go`: bucket burst/refill, per-key isolation, end-to-end 429.
 `cmd/gateway/main_test.go`: dashboard embed + API under one handler.
-`client_test.go`: the Go SDK against the real mux.
+`client_test.go`: the Go SDK against the real mux, including the CT audit
+loop (`TestClientCTAudit`).

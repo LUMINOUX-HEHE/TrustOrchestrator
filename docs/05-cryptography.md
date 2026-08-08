@@ -14,7 +14,7 @@ What this system uses and — critically — what is **real** vs what is
 
 | Primitive | Use | Verified by |
 |---|---|---|
-| **Ed25519** signatures | every trust event, bootstrap cert, workload cert | `TestChainAppendVerify`, `TestVerifyRejectsTampering` |
+| **Ed25519** signatures | every trust event, bootstrap cert, workload cert, CT tree heads | `TestChainAppendVerify`, `TestVerifyRejectsTampering`, `TestSTHSignVerify` |
 | **SHA-256 / SHA3-256** | chain links (`Timeline.Hash` legacy; dual `SHA-256 ‖ SHA3-256` in `hash.go`) — hash agility | `TestDualTimelineRoundtrip`, `TestDualTimelineTamper`, `TestFoldDeterministic` |
 | **FROST (3-of-5, two-round)** | council threshold-signs the epoch handoff; the root key never exists | `TestEpochCommitValidity`, `TestFrostSelfCheck` |
 | **TLS 1.3 mutual** | watchdog↔orchestrator & identity consumer wire | `TestMutualTLSRequest`, `TestWireRealSockets` |
@@ -83,6 +83,35 @@ event identity. Auditors mirror via `NewAuditorLog(algo)`, the fleet's
 integrity watchdog uses the timeline's own digest, so dual chains verify
 everywhere. Upgrade path on top: FIPS-205/L1 anchoring is designed but not
 implemented (needs an external chain anchor).
+
+## Transparency log (RFC 9162, landed)
+
+`ctlog.go` implements the current certificate-transparency spec (RFC 9162;
+the old RFC 6962 draft is superseded — its consistency-proof format changed):
+
+- **Tree**: SHA-256 binary Merkle tree with CT leaf/node hashing —
+  leaf = `sha256(0x00 ‖ entry)`, interior = `sha256(0x01 ‖ l ‖ r)`,
+  split point = largest power of two below the span. One log per org,
+  leaves = the org's signed event hashes in append order; the tree is
+  rebuilt from the timeline on demand, so no separate trusted writer.
+- **Signed tree head (STH)**: `Ed25519` over `tree_size ‖ timestamp ‖ root`
+  with the gateway's per-store log key (`log_key` in `gateway.json`,
+  generated at first boot).
+- **Inclusion proofs** (§2.1.3.2) and **consistency proofs** (§2.1.4.2)
+  are produced by the log and verified by the same public code path on the
+  auditor's side — `VerifyInclusion` / `VerifyConsistency` need only the
+  leaf hash, the index, the proof, and a root; the exact-power-of-two
+  prepend rule (§2.1.4.2 step 2) is handled inside `VerifyConsistency`.
+- **Gossip** (`GossipNode.Observe`): an observer holds a trusted STH and
+  accepts a newer one only when its consistency proof extends it; a root
+  that differs at the same size is a split-brain and raises the alarm.
+
+Property: a gateway that rewrites or reorders history after the fact must
+produce a root that no longer extends the STH it already signed — the
+inclusion proof of a rewritten leaf fails, or the consistency proof
+between the two roots does. This is the external-auditor guarantee the
+signed timeline alone cannot give (a key holder could re-sign a fork); CT
+fixes the *order* in a way any third party can check.
 
 ## At-rest key hierarchy (vault, landed)
 

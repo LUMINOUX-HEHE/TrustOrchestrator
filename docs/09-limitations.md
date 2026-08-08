@@ -20,6 +20,7 @@ skipped/partially implemented** — the same table a judge can read in
 | D12 | TLA mutation tests | P2/P6 violated logs are proofs, not code | Audit |
 | D13 | Network partitions simulated | loopback partition, not router-level | Simulated |
 | D14 | CRL ops | CRL issue/append/verify shipped and tested; reason codes, delta CRLs, OCSP, ledger-backed auto-revocation deferred | Partial |
+| D15 | Transparency witnesses | RFC 9162 log, proofs and gossip ship tested (`ctlog.go`, `TestCTEndpoints`); the real two-party audit loop — a second, independent gateway polling STHs — is deployment (docs/08 §Transparency witnesses), not shipped code | Partial |
 
 ## The honest answer to "is anything faked?"
 

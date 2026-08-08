@@ -28,7 +28,11 @@ single machine deciding anything alone.
   (minimal blast radius, P5).
 - **Prove:** the timeline is an append-only signed hash chain; every rollback
   is a verified fork; recovery post-conditions are checked (P3: a revoked cert
-  is never resurrected).
+  is never resurrected). Each org also exposes a **transparency log**
+  (RFC 9162 certificate-transparency-style Merkle tree over the signed
+  events): signed tree heads, inclusion and consistency proofs let any
+  third party verify the gateway never rewrote history — a rewritten past
+  fails the proofs or forks the root.
 
 | P# | Invariant | Proof |
 |---|---|---|
@@ -45,7 +49,8 @@ single machine deciding anything alone.
   /`detect.go`/`ensemble.go` (ensemble), `audit.go` (transparency), `council.go`
   /`frost.go`/`councilnet.go` (threshold + networked recovery), `rollback.go`
   /`consumer.go` (time travel), `fleet.go`/`transport.go`/`mtls.go` (the mTLS
-  wire), `identity.go` (real X.509 + CRL), `bench.go` (TrustOps)
+  wire), `identity.go` (real X.509 + CRL), `ctlog.go` (RFC 9162 Merkle log,
+  proofs, STH, gossip), `bench.go` (TrustOps)
 - `cmd/to/` — one CLI, three personalities (to-tool / to-bench / to-watchdog by
   basename): genkey, shard, enroll, revoke, bench, watchdog run
 - `cmd/orchestrator/`, `cmd/council/`, `cmd/auditor/` — daily-operation binaries
@@ -78,7 +83,7 @@ single machine deciding anything alone.
 ## Quick start
 
 ```bash
-make test                  # 103 unit + scenario tests, all green
+make test                  # 116 unit + scenario tests, all green
 make benchmark             # TrustOps S1–S7 + baseline + calibration
 make model-check           # TLC on specs/ (requires Java 21+), writes reports/tlc.log
 make model-check-mutations # P2/P6 mutation tests — TLC must report a violation
@@ -243,6 +248,13 @@ curl -H "Authorization: Bearer $TOKEN" localhost:8080/v1/audit?identity=user
 curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8080/v1/backup   # snapshot
 curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8080/v1/restore --data-binary @bundle.json
 curl -H "Authorization: Bearer $TOKEN" localhost:8080/v1/metrics           # prometheus text
+# transparency log (RFC 9162) — any third party can audit the org's history:
+curl -H "Authorization: Bearer $TOKEN" localhost:8080/v1/orgs/acme/ct/sth   # signed tree head
+curl -H "Authorization: Bearer $TOKEN" "localhost:8080/v1/orgs/acme/ct/proof?index=2&size=4"   # inclusion
+curl -H "Authorization: Bearer $TOKEN" "localhost:8080/v1/orgs/acme/ct/proof?from=4&to=6"      # consistency
+curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8080/v1/orgs/acme/ct/gossip \
+     -d '{"tree_size":6,"timestamp":1750000000,"root_b64":"...","signature_b64":"...","proof_from":4,"proof_hex":[...]}'
+     # cross-check an observed STH against the gateway's trusted head
 curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8080/v1/rotate \
      -d '{"shares":[{"x":1,"y":123,"len":32},{"x":2,"y":456,"len":32},{"x":3,"y":789,"len":32}]}' \
      # 3-of-5 KEK unwrap session -> new DEK + epoch; old DEK snapshots stop working (vault.go)
@@ -278,6 +290,9 @@ c := to.NewClient("http://localhost:8080", token)
 c.CreateOrg("acme", "")
 c.Issue("acme", "c1", "user", "c0")
 st, _ := c.State("acme")          // map[string]to.Cert
+sth, _ := c.CTSTH("acme")         // transparency: signed tree head
+_, root, proof, _ := c.CTInclusionProof("acme", 2, 4)
+_ = to.VerifyInclusion(leaf, 2, 4, proof) == root  // audit without trusting the gateway
 ```
 
 ```python

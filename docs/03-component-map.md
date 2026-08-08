@@ -22,6 +22,7 @@ Every source file, its job, key functions, and how it's tested.
 | `mtls.go` | mutual TLS configs (stdlib) | `MutualTLSConfig`, `VerifyPeerIdentity` |
 | `transport.go` | framed mTLS wire client/server | `DialWire`, `WriteWire`, `ServeWire`, `WireMsg` |
 | `ratelimit.go` | token-bucket abuse limiter (API per identity, wire per peer) | `limiter`, `newLimiter`, `allow` |
+| `ctlog.go` | RFC 9162 append-only transparency log: per-org Merkle tree over event hashes, proofs, signed tree heads, gossip observer | `MerkleLog.Append/InclusionProof/ConsistencyProof`, `SignSTH`, `VerifyInclusion`, `VerifyConsistency`, `GossipNode.Observe` |
 | `compliance.go` | evidence-based compliance reports (ISO 27001/SOC 2/PCI DSS/HIPAA/GDPR) | `BuildReport`, `complianceReport` |
 | `bench.go` | scenario runner (S1–S7) | `Bench`, `RunAll`, `Calibrate` |
 | `watch` public CLI types | score output | `Score`, `issuePayload` |
@@ -45,7 +46,8 @@ Every source file, its job, key functions, and how it's tested.
 | `timeline_test.go` | chain/fork/fold/CUSUM/search/bad-locate, rotation, concurrency | 9 |
 | `identity_test.go` | cert CA, expiry, workload reissue, CRL lifecycle | 7 |
 | `frost_test.go` | self-check, split/sign, share verification, DKG ceremony | 7 |
-| `api_test.go` | RBAC, orgs, recovery fork adoption, idempotency, webhooks, restore | 8 |
+| `api_test.go` | RBAC, orgs, recovery fork adoption, idempotency, webhooks, restore, CT endpoints | 9 |
+| `ctlog_test.go` | merkle tree + proofs (all sizes, stale sizes, tamper), STH sign/verify, gossip accept/split-brain/rewrite | 10 |
 | `kill_test.go` | K1–K6 fault injection | 6 |
 | `hash_test.go` | dual-algo chains, legacy-compat, tamper | 5 |
 | `vault_test.go` | KEK unwrap, tenant isolation, rotation kills old DEK | 5 |
@@ -56,14 +58,14 @@ Every source file, its job, key functions, and how it's tested.
 | `consumer_test.go` | rollback delta, diff stateless | 2 |
 | `dkg_test.go` | pairwise ceremony, tamper rejection | 2 |
 | `councilnet_test.go` | networked recovery, blocks under quorum | 2 |
-| `pq_test.go` | hybrid channel, garbage-ciphertext rejection | 2 |
+| `pq_test.go` | hybrid channel, garbage-ciphertext rejection | 3 |
 | `reshare_test.go` | membership rotation, tamper rejection | 2 |
-| `client_test.go` | REST client happy path, error mapping | 2 |
+| `client_test.go` | REST client happy path, error mapping, CT audit loop | 3 |
 | `transport_test.go` | real-socket mTLS frames | 1 |
 | `compliance_test.go` | report statuses, findings, policy violations | 1 |
 
-Root package: 96. `cmd/dnsprobe/main_test.go` 2, `cmd/to/main_test.go` 4,
-`cmd/gateway/main_test.go` 1 → **103 total**, plus three fuzz targets
+Root package: 109. `cmd/dnsprobe/main_test.go` 2, `cmd/to/main_test.go` 4,
+`cmd/gateway/main_test.go` 1 → **116 total**, plus three fuzz targets
 (`fuzz_test.go`). All green: `go test ./... -count=1` (full inventory in
 §07).
 

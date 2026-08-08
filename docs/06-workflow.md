@@ -30,6 +30,11 @@ timeline (signed, parent-chained). Each 30-second cycle:
 - each usable watchdog runs `ObserveBatch(events)` then `Score()`
 - scores stream to the orchestrator over mTLS frames (`transport.go`)
 
+Through the gateway, the same events form the org's **transparency log**
+(`ctlog.go`): `GET /v1/orgs/{org}/ct/sth` serves the signed tree head,
+`/ct/proof` the inclusion/consistency proofs — an auditor can verify the
+history without trusting the gateway (docs/10 §Transparency).
+
 `to-orchestrator status --events canonical.json` → `ENSEMBLE: healthy`.
 
 ## 3. DETECTED (compromise)

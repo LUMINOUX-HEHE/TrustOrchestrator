@@ -15,7 +15,7 @@ What ships, what runs where, and what's the deployment layer's real status.
 | `to-identity` | certificate authority | `ca`, `issue`, `verify` |
 | `to-pdp` | policy decision point | `check --policy --events` |
 | `to-dnsprobe` | W4 external probe: real UDP DNS query | `--server --name --type`, `--poll` |
-| `to-gateway` | management plane: REST API, RBAC, webhooks, backup | `-addr`, `-council-pub`, `-kek-shares`, `-leader-lock` (see docs/10) |
+| `to-gateway` | management plane: REST API, RBAC, webhooks, backup, transparency log | `-addr`, `-council-pub`, `-kek-shares`, `-leader-lock` (see docs/10) |
 
 All built with the same `cmd/to`/`cmd/orchestrator`… sources. `go build ./...`
 exit 0. `make sbom` emits per-binary provenance (module, Go toolchain, VCS
@@ -45,6 +45,14 @@ revision) to `reports/sbom.txt`.
 | systemd units | yes — `deploy/*.service`, run the `bin/linux` ELFs (`make build-linux`) |
 | Docker / Kubernetes | yes — `Dockerfile` + `deploy/kubernetes.yaml` (make docker-build); §12 below |
 | Real VPN / eBPF consumers | **docs only** (to-dns stands in: real UDP query) |
+
+**Transparency witnesses**: the real audit loop needs a *second, independent*
+gateway (read-only `viewer` token) polling `/v1/orgs/{org}/ct/sth`, verifying
+each new head's consistency proof against the previous one, and submitting
+observed heads via `/ct/gossip` — then a rewrite on the primary raises the
+second's alarm even though the primary would happily serve it. Docs/10
+§Transparency has the full protocol; nothing beyond running a second
+instance is required.
 
 ## Live fleet on one host
 

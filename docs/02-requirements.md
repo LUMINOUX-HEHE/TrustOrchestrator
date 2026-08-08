@@ -30,6 +30,7 @@ proves it, and the result.
 | FR3.2 auditor verifies | `AuditorLog.Verify` | `TestChainAppendVerify` | PASS |
 | FR3.3 auditor escalation 3/5 | `DetectEscalated` | `TestAuditorLogAndEscalation` | PASS |
 | FR3.4 auditors never recover | `council` only path | (architectural) | PASS |
+| FR3.5 external transparency log (RFC 9162) | `ctlog.go`: per-org Merkle tree over event hashes, signed STH, inclusion/consistency proofs, gossip observer | `TestMerkleLog*`, `TestSTHSignVerify`, `TestGossip*`, `TestCTEndpoints`, `TestClientCTAudit` | PASS |
 
 **FR4 Recovery council**
 | Requirement | Implementation | Test | Result |
