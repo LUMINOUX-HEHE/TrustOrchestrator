@@ -328,8 +328,3 @@ func prefixForCheck(tl *Timeline, badIdx int) *Timeline {
 	return pre
 }
 
-func zeroize(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
-}

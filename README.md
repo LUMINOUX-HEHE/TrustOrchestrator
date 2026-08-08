@@ -66,7 +66,7 @@ single machine deciding anything alone.
   pool + chart install in one apply
 - `tools/` — tla2tools.jar pinned for the model check
 - `reports/` — regenerable evidence: benchmark, calibration, params, TLC log,
-  kill-test log, canonical/evidence dumps
+  kill-test log, canonical/evidence dumps, compliance report, SBOM (`sbom.txt`)
 - `trust-orchestrator-final-report.md` — the full acceptance report
 
 ## Requirements
@@ -78,13 +78,14 @@ single machine deciding anything alone.
 ## Quick start
 
 ```bash
-make test                  # 51 unit + scenario tests, all green
+make test                  # 103 unit + scenario tests, all green
 make benchmark             # TrustOps S1–S7 + baseline + calibration
 make model-check           # TLC on specs/ (requires Java 21+), writes reports/tlc.log
 make model-check-mutations # P2/P6 mutation tests — TLC must report a violation
 make kill-tests            # K1–K6 fault injection (chaos) suite → reports/kill-tests.log
 make fleet-smoke           # live fleet: 4 processes, real mTLS, healthy + DETECTED verdicts
 make build                 # 10 binaries; make build-linux → static linux/amd64 ELFs
+make sbom                  # per-binary SBOM (module, toolchain, VCS) → reports/sbom.txt
 make docker-build          # container image (Dockerfile) for deploy/kubernetes.yaml
 make helm-lint             # validate helm/trust-orchestrator (requires helm)
 make terraform-validate    # validate terraform/{aws,azure,gcp} (requires terraform)
@@ -162,6 +163,12 @@ go run ./cmd/orchestrator timeline --tail 20 --events reports/canonical.json
 go run ./cmd/orchestrator verify --root <hash> --events reports/canonical.json
 go run ./cmd/orchestrator graph --identity user --events reports/canonical.json
 go run ./cmd/auditor audit --log reports/canonical.json --policy policy.json
+# evidence-based compliance report (ISO 27001 / SOC 2 / PCI DSS / HIPAA / GDPR):
+# optional evidence flags — what is not provided shows up as missing/manual, never skipped
+go run ./cmd/orchestrator report --events reports/canonical.json \
+    --gateway data/gateway.json --audit audit.json \
+    --backup data/backups/bk-123.json --vault-keys data/gateway.keys \
+    --policy policy.json --out reports/compliance.json
 ```
 
 Consumers: workload-cert issuer + policy reference
@@ -254,7 +261,10 @@ threshold signature against its configured council trust anchor
 (`--council-pub`), the fork's chain integrity, and that it descends from
 the org's verified prefix before adopting it — no shards or seeds ever
 cross this surface. Roles: admin / operator / auditor / viewer; orgs field
-on a user scopes them to specific tenants. Full route table in `api.go`;
+on a user scopes them to specific tenants. Every request is rate-limited
+per token identity (token bucket; 429 + Retry-After when drained, `/v1/health`
+exempt) and the watchdog wire is budgeted per peer — full detail in
+`docs/10-gateway.md §Rate limiting`. Full route table in `api.go`;
 end-to-end checks in `api_test.go`.
 
 Dashboard: open `http://localhost:8080/`, paste the token, manage orgs,

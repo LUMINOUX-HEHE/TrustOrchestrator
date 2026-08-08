@@ -106,6 +106,9 @@ func (s *Store) Handler() http.Handler {
 	s.route(mux, "POST /v1/orgs/{org}/scores", []string{RoleOperator, RoleAdmin}, true, s.handleScores)
 	s.route(mux, "POST /v1/orgs/{org}/recover", []string{RoleOperator, RoleAdmin}, true, s.handleRecover)
 	s.route(mux, "GET /v1/orgs/{org}/pubkey", []string{RoleViewer, RoleAuditor, RoleOperator, RoleAdmin}, true, s.handleOrgPubKey)
+	s.route(mux, "GET /v1/orgs/{org}/ct/sth", []string{RoleViewer, RoleAuditor, RoleOperator, RoleAdmin}, true, s.handleCTSTH)
+	s.route(mux, "GET /v1/orgs/{org}/ct/proof", []string{RoleViewer, RoleAuditor, RoleOperator, RoleAdmin}, true, s.handleCTProof)
+	s.route(mux, "POST /v1/orgs/{org}/ct/gossip", []string{RoleViewer, RoleAuditor, RoleOperator, RoleAdmin}, true, s.handleCTGossip)
 	s.route(mux, "GET /v1/audit", []string{RoleAuditor, RoleOperator, RoleAdmin}, false, s.handleAudit)
 	s.route(mux, "GET /v1/webhooks", []string{RoleAdmin}, false, s.handleListWebhooks)
 	s.route(mux, "POST /v1/webhooks", []string{RoleAdmin}, false, s.handleCreateWebhook)
@@ -135,6 +138,13 @@ func (s *Store) route(mux *http.ServeMux, pattern string, roles []string, scoped
 				writeErr(w, http.StatusForbidden, errors.New("insufficient role: need "+strings.Join(roles, "|")))
 				return
 			}
+		}
+		// token-bucket per identity; health is the liveness probe and stays
+		// unthrottled (it has no token).
+		if pattern != "GET /v1/health" && !s.apiLimiter.allow(tokenHashStr) {
+			w.Header().Set("Retry-After", "1")
+			writeErr(w, http.StatusTooManyRequests, errors.New("rate limit exceeded"))
+			return
 		}
 		var t *Tenant
 		if scoped {
@@ -462,6 +472,132 @@ func (s *Store) handleDeleteOrg(w http.ResponseWriter, r *http.Request, t *Tenan
 func (s *Store) handleOrgPubKey(w http.ResponseWriter, r *http.Request, t *Tenant) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"org": t.ID, "pubkey_hex": hex.EncodeToString(t.tl.Pub()),
+	})
+}
+
+// orgMerkle is the transparent view of one org: the RFC 9162 log whose
+// leaves are the hashes of its signed events, in append order.
+func orgMerkle(t *Tenant) *MerkleLog {
+	m := NewMerkleLog()
+	for _, e := range t.tl.Events() {
+		m.Append(e.Hash())
+	}
+	return m
+}
+
+func (s *Store) ctLogPub() ed25519.PublicKey {
+	return ed25519.NewKeyFromSeed(s.LogKey).Public().(ed25519.PublicKey)
+}
+
+// handleCTSTH serves the org's signed tree head (RFC 9162 get-sth): tree
+// size, root, timestamp and the log signature over the whole STH.
+func (s *Store) handleCTSTH(w http.ResponseWriter, r *http.Request, t *Tenant) {
+	s.mu.Lock()
+	m := orgMerkle(t)
+	s.mu.Unlock()
+	sth := SignSTH(ed25519.NewKeyFromSeed(s.LogKey), m.Root(), m.Size(), time.Now().Unix())
+	writeJSON(w, http.StatusOK, map[string]any{
+		"org": t.ID, "log_key_hex": hex.EncodeToString(s.ctLogPub()),
+		"tree_size": sth.TreeSize, "timestamp": sth.Timestamp,
+		"root_hex": hex.EncodeToString(sth.Root), "signature_hex": hex.EncodeToString(sth.Signature),
+	})
+}
+
+// handleCTProof serves inclusion or consistency proofs against a
+// requested size: ?index=&size= (inclusion, verifiable against that
+// size's root) or ?from=&to= (consistency between the two sizes).
+func (s *Store) handleCTProof(w http.ResponseWriter, r *http.Request, t *Tenant) {
+	q := r.URL.Query()
+	s.mu.Lock()
+	m := orgMerkle(t)
+	s.mu.Unlock()
+	switch {
+	case q.Has("index"):
+		idx, err := strconv.Atoi(q.Get("index"))
+		size, serr := strconv.Atoi(q.Get("size"))
+		if err != nil || serr != nil || idx < 0 || size <= 0 {
+			writeErr(w, http.StatusBadRequest, errors.New("index and size must be non-negative integers"))
+			return
+		}
+		_, proof, err := m.InclusionProof(idx, size)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"org": t.ID, "index": idx, "size": size,
+			"leaf_hash_hex": hex.EncodeToString(m.Hashes()[idx]),
+			"root_hex":      hex.EncodeToString(mth(m.Hashes(), 0, size)),
+			"proof":         hashesHex(proof),
+		})
+	case q.Has("from"):
+		from, err := strconv.Atoi(q.Get("from"))
+		to, serr := strconv.Atoi(q.Get("to"))
+		if err != nil || serr != nil || from < 0 || to <= from {
+			writeErr(w, http.StatusBadRequest, errors.New("from and to must satisfy 0 <= from < to"))
+			return
+		}
+		oldRoot, newRoot, proof, err := m.ConsistencyProof(from, to)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"org": t.ID, "from": from, "to": to,
+			"old_root_hex": hex.EncodeToString(oldRoot), "new_root_hex": hex.EncodeToString(newRoot),
+			"proof": hashesHex(proof),
+		})
+	default:
+		writeErr(w, http.StatusBadRequest, errors.New("give index+size (inclusion) or from+to (consistency)"))
+	}
+}
+
+func hashesHex(p [][]byte) []string {
+	out := make([]string, len(p))
+	for i, h := range p {
+		out[i] = hex.EncodeToString(h)
+	}
+	return out
+}
+
+// handleCTGossip is the transparency verifier: a reporter submits an STH
+// it saw (signed, with the consistency proof against the size it trusts),
+// and the gateway checks the signature and, when the reported head is
+// newer, that the gateway's current head is a prefix of it. accepted=false
+// with alarm set means the log or the reporter lied.
+func (s *Store) handleCTGossip(w http.ResponseWriter, r *http.Request, t *Tenant) {
+	var in struct {
+		TreeSize  int64    `json:"tree_size"`
+		Timestamp int64    `json:"timestamp"`
+		Root      []byte   `json:"root_b64"`
+		Signature []byte   `json:"signature_b64"`
+		ProofFrom int      `json:"proof_from"`
+		Proof     []string `json:"proof_hex"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	sth := SignedTreeHead{TreeSize: in.TreeSize, Timestamp: in.Timestamp, Root: in.Root, Signature: in.Signature}
+	proof := make([][]byte, len(in.Proof))
+	for i, h := range in.Proof {
+		b, err := hex.DecodeString(h)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		proof[i] = b
+	}
+	node := NewGossipNode(s.ctLogPub(), &SignedTreeHead{TreeSize: t.ctSize, Root: t.ctRoot})
+	accepted, _ := node.Observe(&sth, proof, in.ProofFrom)
+	if accepted && sth.TreeSize > t.ctSize {
+		t.ctSize, t.ctRoot = sth.TreeSize, sth.Root
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"org": t.ID, "accepted": accepted,
+		"alarm":             node.Alarm(),
+		"trusted_tree_size": t.ctSize,
+		"trusted_root_hex":  hex.EncodeToString(t.ctRoot),
 	})
 }
 
@@ -889,7 +1025,7 @@ func (s *Store) handleRotate(w http.ResponseWriter, r *http.Request, t *Tenant) 
 		Shares []Shard `json:"shares"`
 	}
 	dec := json.NewDecoder(io.LimitReader(r.Body, maxBody))
-if err := dec.Decode(&body); err != nil || len(body.Shares) == 0 {
+	if err := dec.Decode(&body); err != nil || len(body.Shares) == 0 {
 		writeErr(w, http.StatusBadRequest, errors.New("rotate: body needs {\"shares\": [3 or more Shard JSON files]}"))
 		return
 	}

@@ -7,7 +7,7 @@ DOCKER   := docker
 GOOS_    := linux
 GOARCH_  := amd64
 
-.PHONY: all build build-linux test benchmark kill-tests model-check model-check-mutations fleet-smoke docker-build helm-lint terraform-validate clean
+.PHONY: all build build-linux test benchmark kill-tests model-check model-check-gateway model-check-pq model-check-extra model-check-mutations model-check-mutations-extra fleet-smoke docker-build helm-lint terraform-validate sbom clean
 
 all: build
 
@@ -60,6 +60,12 @@ terraform-validate:
 	cd terraform/azure && terraform fmt -check -recursive && terraform validate
 	cd terraform/gcp && terraform fmt -check -recursive && terraform validate
 
+# sbom: per-binary software bill of materials via `go version -m` (module,
+# toolchain, VCS provenance) into reports/sbom.txt. No third-party tooling:
+# the module is stdlib-only, so there is no dependency tree to emit.
+sbom: build
+	for f in $(wildcard $(BIN)/to-*); do echo "== $$f"; $(GO) version -m "$$f"; done | tee reports/sbom.txt
+
 test:
 	$(GO) test ./...
 
@@ -78,6 +84,25 @@ model-check-mutations:   # P2/P6 mutation tests (test plan §3): TLC must report
 		-config TrustOrchestratorP2Mutant.cfg TrustOrchestratorP2Mutant.tla 2>&1 | tee ../reports/mutation-p2.log | grep -q "Invariant Safety is violated"
 	cd specs && java -jar ../tools/tla2tools.jar -workers 12 \
 		-config TrustOrchestratorP6Mutant.cfg TrustOrchestratorP6Mutant.tla 2>&1 | tee ../reports/mutation-p6.log | grep -q "Invariant Safety is violated"
+
+# model-check-gateway / model-check-pq: the P7 (gateway fork adoption) and
+# P8 (hybrid PQ handshake) invariants — the API layer beyond the core
+# engine. model-check-extra runs both.
+model-check-gateway:     # P7: adoption gate — quorum, prefix descent, epoch monotonic
+	cd specs && java -jar ../tools/tla2tools.jar -workers 12 \
+		-config Gateway.cfg Gateway.tla 2>&1 | tee ../reports/tlc-gateway.log | grep -q "No error has been found"
+
+model-check-pq:          # P8: established session requires both hybrid halves untampered
+	cd specs && java -jar ../tools/tla2tools.jar -workers 12 \
+		-config PQHandshake.cfg PQHandshake.tla 2>&1 | tee ../reports/tlc-pq.log | grep -q "No error has been found"
+
+model-check-extra: model-check-gateway model-check-pq
+
+model-check-mutations-extra:   # P7/P8 mutation tests: TLC must report a violation
+	cd specs && java -jar ../tools/tla2tools.jar -workers 12 \
+		-config GatewayP7Mutant.cfg GatewayP7Mutant.tla 2>&1 | tee ../reports/mutation-p7.log | grep -q "Invariant Safety is violated"
+	cd specs && java -jar ../tools/tla2tools.jar -workers 12 \
+		-config PQHandshakeMutant.cfg PQHandshakeMutant.tla 2>&1 | tee ../reports/mutation-pq.log | grep -q "Invariant Safety is violated"
 
 clean:
 	rm -rf $(BIN) reports bootstrap.key shard-*.json node.key node.cert.json

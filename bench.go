@@ -576,21 +576,26 @@ func (b *Bench) ScenarioVerifyScaling() Metrics {
 	}
 	small := build(10_000)
 	large := build(100_000)
-	// Best-of-N: the min excludes scheduler/timer interference (single-sample
-	// timing on a shared OS is flaky, NFR3.3 needs the ratio to be stable).
-	best := func(fn func() bool) time.Duration {
-		var best time.Duration
-		for i := 0; i < 3; i++ {
-			t0 := time.Now()
-			fn()
-			if d := time.Since(t0); best == 0 || d < best {
-				best = d
-			}
+	// Alternating rounds: measuring 10k and 100k in the same time window
+	// (not all-small-then-all-large) keeps both sizes under the same
+	// scheduler load — a load phase shift between sizes is exactly what
+	// inflates the ratio on a shared machine. Best-of-N: the min per size
+	// excludes transients.
+	bestOf := func(d, prev time.Duration) time.Duration {
+		if prev == 0 || d < prev {
+			return d
 		}
-		return best
+		return prev
 	}
-	tSmall := best(small.Verify)
-	tLarge := best(large.Verify)
+	var tSmall, tLarge time.Duration
+	for i := 0; i < 3; i++ {
+		t0 := time.Now()
+		small.Verify()
+		tSmall = bestOf(time.Since(t0), tSmall)
+		t0 = time.Now()
+		large.Verify()
+		tLarge = bestOf(time.Since(t0), tLarge)
+	}
 	m.VerifyEvents = 100_000
 	m.VerifyTime = tLarge
 	m.VerifyPerEvent = tLarge / 100_000

@@ -80,6 +80,7 @@ proves it, and the result.
 | NFR4.2 stdlib primitives | `go.mod` | PASS |
 | NFR4.3 no plaintext post-recovery | recovery path | PASS |
 | NFR4.4 tolerate 1 Byzantine | ensembles tests | PASS |
+| NFR4.5 abuse limiting: every API request and wire frame budgeted | `ratelimit.go` token buckets (per token identity; per mTLS peer) | `TestLimiterBurstAndRefill`, `TestLimiterPerKeyIsolation`, `TestAPIRateLimit429` | PASS |
 | NFR5.1 single cmd + single config | `enroll` | PASS |
 | NFR5.2 human-readable action log | `reports/action-log.txt` | PASS |
 | NFR6.1 every claim → benchmark | `benchmark.json` | PASS |

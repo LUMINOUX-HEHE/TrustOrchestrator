@@ -99,6 +99,21 @@ enforced identically on both paths.
 recovery counters + uptime/users/orgs. The dashboard renders org cards and
 the raw text.
 
+## Rate limiting
+
+Every request is budgeted by a **token bucket keyed on the token identity**
+(`ratelimit.go`, wired in the route middleware): 20 tokens/s refill, burst
+40, one token per request. A drained identity gets `429 Too Many Requests`
+with `Retry-After: 1` and is never queued — the bucket *denies*, it does not
+delay. `GET /v1/health` is exempt (the liveness probe has no token and must
+not be throttled). Buckets are in-memory and per-token: one client's flood
+cannot spend another identity's budget, and a restart resets them.
+
+The **mTLS watchdog wire is budgeted per peer** the same way (1 frame/s,
+burst 4 — legit nodes send one frame per 30s): a peer that drains its bucket
+is dropped from the stream, so the wire path cannot bypass the API's
+throttle (there is no unthrottled code path).
+
 ## Deployment
 
 - `to-gateway -addr :8443 -tls-cert cert.pem -tls-key key.pem` serves HTTPS
@@ -120,5 +135,6 @@ the raw text.
 `api_test.go` (root package): auth/RBAC, org lifecycle, detection →
 webhook, token scoping, idempotency, durable outbox, council recovery via
 API fork+commit, backup/restore round-trip, tampered-bundle rejection.
+`ratelimit_test.go`: bucket burst/refill, per-key isolation, end-to-end 429.
 `cmd/gateway/main_test.go`: dashboard embed + API under one handler.
 `client_test.go`: the Go SDK against the real mux.

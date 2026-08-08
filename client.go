@@ -7,6 +7,7 @@ package trustorchestrator
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -260,4 +261,77 @@ func (c *Client) CreateWebhook(url, secret string, events []string) error {
 
 func (c *Client) DeleteWebhook(id string) error {
 	return c.json("DELETE", "/v1/webhooks/"+id, nil, nil)
+}
+
+// CT transparency surface (RFC 9162): STH + proofs are hex-encoded as
+// served; the caller can hex-decode and run VerifyInclusion /
+// VerifyConsistency with the log key from the STH.
+
+// STH is one signed tree head as served by /ct/sth.
+type STH struct {
+	Org          string `json:"org"`
+	LogKeyHex    string `json:"log_key_hex"`
+	TreeSize     int64  `json:"tree_size"`
+	Timestamp    int64  `json:"timestamp"`
+	RootHex      string `json:"root_hex"`
+	SignatureHex string `json:"signature_hex"`
+}
+
+func (c *Client) CTSTH(org string) (STH, error) {
+	var out STH
+	return out, c.json("GET", "/v1/orgs/"+org+"/ct/sth", nil, &out)
+}
+
+// CTInclusionProof fetches the proof that leaf idx was in the tree at the
+// given size. The returned root is that size's root; proof elements are
+// hex strings.
+func (c *Client) CTInclusionProof(org string, idx, size int) (leafHex, rootHex string, proof []string, err error) {
+	var out struct {
+		LeafHashHex string   `json:"leaf_hash_hex"`
+		RootHex     string   `json:"root_hex"`
+		Proof       []string `json:"proof"`
+	}
+	e := c.json("GET", fmt.Sprintf("/v1/orgs/%s/ct/proof?index=%d&size=%d", org, idx, size), nil, &out)
+	return out.LeafHashHex, out.RootHex, out.Proof, e
+}
+
+// CTConsistencyProof fetches the proof that the tree at `to` extends the
+// tree at `from`, with both roots.
+func (c *Client) CTConsistencyProof(org string, from, to int) (oldRootHex, newRootHex string, proof []string, err error) {
+	var out struct {
+		OldRootHex string   `json:"old_root_hex"`
+		NewRootHex string   `json:"new_root_hex"`
+		Proof      []string `json:"proof"`
+	}
+	e := c.json("GET", fmt.Sprintf("/v1/orgs/%s/ct/proof?from=%d&to=%d", org, from, to), nil, &out)
+	return out.OldRootHex, out.NewRootHex, out.Proof, e
+}
+
+// CTGossip submits an observed STH (with its consistency proof from
+// proofFrom) for cross-checking. Returns whether it was accepted, any
+// alarm raised, and the gateway's current trusted head.
+func (c *Client) CTGossip(org string, sth STH, proofFrom int, proof []string) (accepted bool, alarm string, trustedSize int64, trustedRootHex string, err error) {
+	var out struct {
+		Accepted    bool   `json:"accepted"`
+		Alarm       string `json:"alarm"`
+		TrustedSize int64  `json:"trusted_tree_size"`
+		TrustedRoot string `json:"trusted_root_hex"`
+	}
+	e := c.json("POST", "/v1/orgs/"+org+"/ct/gossip", map[string]any{
+		"tree_size": sth.TreeSize, "timestamp": sth.Timestamp,
+		"root_b64":      hexDecode(sth.RootHex),
+		"signature_b64": hexDecode(sth.SignatureHex),
+		"proof_from":    proofFrom, "proof_hex": proof,
+	}, &out)
+	return out.Accepted, out.Alarm, out.TrustedSize, out.TrustedRoot, e
+}
+
+// hexDecode returns the raw bytes for a hex string; json marshals []byte
+// to base64, which is what the gossip endpoint expects. Garbage → nil.
+func hexDecode(hexStr string) []byte {
+	b, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return nil
+	}
+	return b
 }

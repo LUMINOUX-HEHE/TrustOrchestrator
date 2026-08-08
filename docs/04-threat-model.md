@@ -14,7 +14,7 @@ deployment gaps, `09-limitations.md`).
 
 ## The benchmark scenarios `reports/benchmark.json`
 
-Produced by `benbench.go` scenario runner (S1–S7), regenerable with
+Produced by `bench.go` scenario runner (S1–S7), regenerable with
 `make benchmark`. `detected` is whatever the ensemble decides; `fp` (false
 positive) must be `false` in the steady state; `rollback_correct` true.
 
@@ -36,7 +36,6 @@ positive) must be `false` in the steady state; `rollback_correct` true.
 - An insider can only send **low scores on one ID**.
 - `Detect` requires `≥3/5`; a single suppressed ID = not detected (S3/insider)
   — checked in `TestInsiderCan'tTrigger`.
-- One partner partner partner partner partner bed.
 
 ## What must NEVER happen
 
@@ -46,6 +45,7 @@ positive) must be `false` in the steady state; `rollback_correct` true.
 | rollback resurrects revoked | P3 law | `TestFoldNoResurrection` |
 | two canonical anchors | P5 (fork safety) | `TestForkRaceRejected`, TLA |
 | auditors trigger recovery | P6 (council-only) | `TestAuditor…` |
+| API / wire flood | token bucket per identity (REST) and per peer (mTLS wire) | `TestLimiter*`, `TestAPIRateLimit429` |
 
 ## Post-recovery verification (FR6)
 

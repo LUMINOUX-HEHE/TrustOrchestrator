@@ -57,3 +57,20 @@ jobs:
           cd specs
           java -jar ../tools/tla2tools.jar -workers 2 -config TrustOrchestratorCI.cfg TrustOrchestrator.tla | tee ../reports/tlc-ci.log
           grep -q "No error has been found" ../reports/tlc-ci.log
+      - name: TLC on the gateway adoption gate (P7)
+        run: |
+          cd specs
+          java -jar ../tools/tla2tools.jar -workers 2 -config Gateway.cfg Gateway.tla | tee ../reports/tlc-gateway-ci.log
+          grep -q "No error has been found" ../reports/tlc-gateway-ci.log
+      - name: TLC on the PQ hybrid handshake (P8)
+        run: |
+          cd specs
+          java -jar ../tools/tla2tools.jar -workers 2 -config PQHandshake.cfg PQHandshake.tla | tee ../reports/tlc-pq-ci.log
+          grep -q "No error has been found" ../reports/tlc-pq-ci.log
+      - name: TLC mutation tests must report violations (P2/P6/P7/P8)
+        run: |
+          cd specs
+          java -jar ../tools/tla2tools.jar -workers 2 -config GatewayP7Mutant.cfg GatewayP7Mutant.tla | tee ../reports/mutation-p7-ci.log
+          grep -q "Invariant Safety is violated" ../reports/mutation-p7-ci.log
+          java -jar ../tools/tla2tools.jar -workers 2 -config PQHandshakeMutant.cfg PQHandshakeMutant.tla | tee ../reports/mutation-pq-ci.log
+          grep -q "Invariant Safety is violated" ../reports/mutation-pq-ci.log

@@ -60,6 +60,8 @@ func main() {
 		err = rollbackDryRun(tl, args)
 	case "serve":
 		err = serve(args)
+	case "report":
+		err = report(args)
 	default:
 		usage()
 	}
@@ -77,7 +79,10 @@ func usage() {
   to-orchestrator graph --identity <fingerprint> [--events <file>]
   to-orchestrator policy reload --policy <policy.json> [--events <file>]
   to-orchestrator rollback --dry-run [--to <checkpoint-hash>] [--events <file>]
-  to-orchestrator serve --listen <addr> --ca <ca.der> --cert <leaf.der> --key <key.hex>`)
+  to-orchestrator serve --listen <addr> --ca <ca.der> --cert <leaf.der> --key <key.hex>
+  to-orchestrator report [--events <file>] [--gateway <gateway.json>] [--audit <audit.json>]
+                     [--backup <file>] [--vault-keys <file>] [--policy <policy.json>]
+                     [--out <file>]`)
 	os.Exit(1)
 }
 
@@ -341,6 +346,124 @@ func rollbackDryRun(tl *to.Timeline, args []string) error {
 		fmt.Println("    -", c)
 	}
 	fmt.Printf("  state: %d certs pre-compromise -> %d certs compromised\n", len(pre.Certs), len(post.Certs))
+	return nil
+}
+
+// report (compliance.go): evidence-based compliance report over the files
+// the operator has — timeline dump, gateway.json, audit export, backup and
+// vault-key artifacts. Writes the JSON report to --out and prints a status
+// summary. Flags are optional evidence: what is not provided shows up as
+// missing/manual in the report, not silently skipped.
+func report(args []string) error {
+	events, gateway, auditPath, backupPath, vaultPath, policyPath, out := "", "", "", "", "", "", "reports/compliance.json"
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--events":
+			if i+1 < len(args) {
+				events, i = args[i+1], i+1
+			}
+		case "--gateway":
+			if i+1 < len(args) {
+				gateway, i = args[i+1], i+1
+			}
+		case "--audit":
+			if i+1 < len(args) {
+				auditPath, i = args[i+1], i+1
+			}
+		case "--backup":
+			if i+1 < len(args) {
+				backupPath, i = args[i+1], i+1
+			}
+		case "--vault-keys":
+			if i+1 < len(args) {
+				vaultPath, i = args[i+1], i+1
+			}
+		case "--policy":
+			if i+1 < len(args) {
+				policyPath, i = args[i+1], i+1
+			}
+		case "--out":
+			if i+1 < len(args) {
+				out, i = args[i+1], i+1
+			}
+		}
+	}
+	tl, err := load(events)
+	if err != nil {
+		return err
+	}
+	ev := &to.ComplianceEvidence{Timeline: tl}
+	if gateway != "" {
+		raw, err := os.ReadFile(gateway)
+		if err != nil {
+			return fmt.Errorf("--gateway: %w", err)
+		}
+		var gw struct {
+			Users    map[string]*to.User `json:"users"`
+			Webhooks []json.RawMessage   `json:"webhooks"`
+		}
+		if err := json.Unmarshal(raw, &gw); err != nil {
+			return fmt.Errorf("--gateway: %w", err)
+		}
+		ev.Users = map[string]string{}
+		for id, u := range gw.Users {
+			ev.Users[id] = u.Role
+		}
+		ev.Webhooks = len(gw.Webhooks)
+	}
+	if auditPath != "" {
+		raw, err := os.ReadFile(auditPath)
+		if err != nil {
+			return fmt.Errorf("--audit: %w", err)
+		}
+		var actions []to.AuditEntry
+		if json.Unmarshal(raw, &actions) != nil {
+			var wrapped struct {
+				Actions []to.AuditEntry `json:"actions"`
+			}
+			if err := json.Unmarshal(raw, &wrapped); err != nil {
+				return fmt.Errorf("--audit: not an audit export (need []AuditEntry or {\"actions\":[...]}): %w", err)
+			}
+			actions = wrapped.Actions
+		}
+		ev.AuditEntries = actions
+	}
+	if backupPath != "" {
+		if _, err := os.Stat(backupPath); err != nil {
+			return fmt.Errorf("--backup: %w", err)
+		}
+		ev.HasBackup = true
+	}
+	if vaultPath != "" {
+		if _, err := os.Stat(vaultPath); err != nil {
+			return fmt.Errorf("--vault-keys: %w", err)
+		}
+		ev.HasVault = true
+	}
+	if policyPath != "" {
+		raw, err := os.ReadFile(policyPath)
+		if err != nil {
+			return fmt.Errorf("--policy: %w", err)
+		}
+		if err := json.Unmarshal(raw, &ev.Policy); err != nil {
+			return fmt.Errorf("--policy: %w", err)
+		}
+	}
+	r := to.BuildComplianceReport(ev)
+	b, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(out, b, 0o600); err != nil {
+		return err
+	}
+	for _, f := range r.Frameworks {
+		fmt.Printf("%s: %d pass, %d manual, %d missing\n", f.Name, f.Pass, f.Manual, f.Missing)
+	}
+	for _, fn := range r.Findings {
+		fmt.Println("FINDING:", fn)
+	}
+	fmt.Printf("report written to %s\n", out)
 	return nil
 }
 

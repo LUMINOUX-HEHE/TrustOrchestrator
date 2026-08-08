@@ -3,12 +3,12 @@
 ## How to reproduce everything
 
 ```
-go test ./... -count=1            # 51 tests
+go test ./... -count=1            # 103 tests
 go test -run 'TestK' ./... > reports/kill-tests.log
 go test ./... -coverprofile=coverage.out   # then: go tool cover -func=coverage.out
 make bench                    # regenerate reports/*.json
 make model-check              # TLA P1–P6 (needs java)
-make build                    # 9 binaries
+make build                    # 10 binaries
 ```
 
 ## Inventory and evidence
@@ -19,28 +19,44 @@ make build                    # 9 binaries
 | `reports/audit-round-2.md` | re-audit, 5 bad §9 rows fixed | yes |
 | `reports/kill-tests.log` | K1–K6 | yes |
 | `reports/benchmark.json` | 10 scenario rows | yes |
-| `coverage.out` | 46.1% statements | yes |
+| `coverage.out` | 59.3% statements | yes |
 | `reports/tlc.log`, `mutation-p2.log`, `mutation-p6.log` | model check | yes |
 
-## Test inventory (51)
+## Test inventory (103)
 
 | Group | File | # | Covers |
 |---|---|---|---|
 | Core scenes | `core_test.go` | 22 | quorum, insider, partition, combined, slow attack, workload, escalation, W2, mirror, mTLS, identity, end-to-end |
-| Timeline | `timeline_test.go` | 8 | append/verify/fork/fold/CUSUM/search/locate-bad |
-| Identity | `identity_test.go` | 3 | issue/verify, expiry, reissue workload |
-| Consumer | `consumer_test.go` | 2 | rollback delta, diff stateless |
+| Timeline | `timeline_test.go` | 9 | append/verify/fork/fold/CUSUM/search/locate-bad, rotation, concurrency |
+| Identity | `identity_test.go` | 7 | issue/verify, expiry, reissue workload, CRL, DP |
+| FROST | `frost_test.go` | 7 | self-check, split/sign, share verification, DKG ceremony |
+| API | `api_test.go` | 8 | RBAC, orgs, recovery fork adoption, idempotency, webhooks, restore |
 | Kill | `kill_test.go` | 6 | K1 kill-one … K6 corrupt log |
-| Wire | `transport_test.go` | 1 | real-socket mTLS frames |
+| Hash agility | `hash_test.go` | 5 | dual-algo chains, legacy-compat, tamper |
+| Vault | `vault_test.go` | 5 | KEK unwrap, tenant isolation, rotation kills old DEK |
+| Regressions | `regressions_test.go` | 4 | previously fixed defects |
+| Blind FROST | `blindfrost_test.go` | 3 | unblinded verify, link resistance |
 | Fleet | `fleet_test.go` | 3 | live-verdict, frame-loss reconnect, concurrent fan-in |
+| Consumer | `consumer_test.go` | 2 | rollback delta, diff stateless |
+| DKG | `dkg_test.go` | 2 | pairwise ceremony, tamper rejection |
+| Council net | `councilnet_test.go` | 2 | networked recovery, blocks under quorum |
+| PQ | `pq_test.go` | 2 | hybrid channel, garbage-ciphertext rejection |
+| Reshare | `reshare_test.go` | 2 | membership rotation, tamper rejection |
+| Client SDK | `client_test.go` | 2 | REST client happy path, error mapping |
+| Wire | `transport_test.go` | 1 | real-socket mTLS frames |
+| Compliance | `compliance_test.go` | 1 | report statuses, findings, policy violations |
+| Rate limit | `ratelimit_test.go` | 3 | bucket burst/refill, per-key isolation, API 429 |
 | DNS | `cmd/dnsprobe/main_test.go` | 2 | real UDP loop, NXDOMAIN decode |
 | CLI | `cmd/to/main_test.go` | 4 | enroll, enroll-node-id, bootstrap-revoked, probe-cmd exit mapping |
+| Gateway CLI | `cmd/gateway/main_test.go` | 1 | boot + admin token |
 
-**All 51 PASS, exit 0** (`go test ./... -count=1`), 2026-08-03.
+Plus three fuzz targets (`fuzz_test.go`): Shamir round-trip, timeline unmarshal, wire frames.
+
+**All 103 PASS, exit 0** (`go test ./... -count=1`), 2026-08-08.
 
 ## Coverage notes
 
-- total `46.1%` (core crypto/safety ~100%; fleet.go is new code in this round); CLI daemons 0% by design
+- total `59.3%` (core crypto/safety ~100%; fleet.go is new code in this round); CLI daemons 0% by design
   (no `_test.go` in `cmd/auditor|council|identity|orchestrator|pdp`; they are
   covered by smoke runs in `06-workflow.md`).
 - `fleet.go` is real sockets (TLS 1.3 mTLS on loopback); the servers

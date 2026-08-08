@@ -2,7 +2,7 @@
 
 What ships, what runs where, and what's the deployment layer's real status.
 
-## The 8 binaries (`make build`, output to `bin/`)
+## The 10 binaries (`make build`, output to `bin/`)
 
 | Binary | Purpose | Key commands |
 |---|---|---|
@@ -14,9 +14,12 @@ What ships, what runs where, and what's the deployment layer's real status.
 | `to-auditor` | mirror log checker | `audit --log` |
 | `to-identity` | certificate authority | `ca`, `issue`, `verify` |
 | `to-pdp` | policy decision point | `check --policy --events` |
+| `to-dnsprobe` | W4 external probe: real UDP DNS query | `--server --name --type`, `--poll` |
+| `to-gateway` | management plane: REST API, RBAC, webhooks, backup | `-addr`, `-council-pub`, `-kek-shares`, `-leader-lock` (see docs/10) |
 
 All built with the same `cmd/to`/`cmd/orchestrator`… sources. `go build ./...`
-exit 0.
+exit 0. `make sbom` emits per-binary provenance (module, Go toolchain, VCS
+revision) to `reports/sbom.txt`.
 
 ## Bootstrap ceremony (guide §5, air-gapped)
 

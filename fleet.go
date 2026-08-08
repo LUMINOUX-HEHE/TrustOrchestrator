@@ -13,6 +13,7 @@ package trustorchestrator
 
 import (
 	"crypto/tls"
+	"errors"
 	"net"
 	"sync"
 	"time"
@@ -37,6 +38,7 @@ type FleetServer struct {
 	scores   map[string]scoreAt
 	enrolled []string
 	fans     []chan FleetVerdict
+	frames   *limiter // per-peer frame budget (ratelimit.go); mTLS path must not bypass the API throttle
 
 	stop chan struct{}
 	once sync.Once
@@ -60,7 +62,8 @@ func NewFleet(threshold float64, quorum int, staleFor time.Duration) *FleetServe
 		staleFor = 5 * 30 * time.Second // five 30s cycles
 	}
 	return &FleetServer{threshold: threshold, quorum: quorum,
-		staleFor: staleFor, scores: map[string]scoreAt{}, stop: make(chan struct{})}
+		staleFor: staleFor, scores: map[string]scoreAt{}, stop: make(chan struct{}),
+		frames: newLimiter(wireRate, wireBurst)}
 }
 
 // Handle is the server-side per-connection service: one goroutine per peer,
@@ -69,6 +72,9 @@ func NewFleet(threshold float64, quorum int, staleFor time.Duration) *FleetServe
 func (f *FleetServer) Handle(conn net.Conn) error {
 	defer conn.Close()
 	return ServeWire(conn, func(m WireMsg) error {
+		if !f.frames.allow(conn.RemoteAddr().String()) {
+			return errors.New("rate limit exceeded") // flood: drop the peer
+		}
 		f.Ingest(m)
 		return nil
 	})

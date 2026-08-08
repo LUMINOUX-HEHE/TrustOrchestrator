@@ -45,10 +45,12 @@ type Tenant struct {
 	Created int64  `json:"created"`
 	KeyHash string `json:"key_hash"` // ponytail: demo tier stores the root key in timeline.json, like evidence dumps
 
-	tl       *Timeline
-	fleet    *FleetServer // score fan-in + Detect fusion for this org
-	detected bool
-	counters map[string]int64 // events/issues/revokes/detections/recoveries totals
+	tl         *Timeline
+	fleet      *FleetServer // score fan-in + Detect fusion for this org
+	detected   bool
+	counters   map[string]int64 // events/issues/revokes/detections/recoveries totals
+	ctSize     int64            // highest CT tree head accepted via gossip for this org
+	ctRoot     []byte           // ...and its root hash
 }
 
 // Webhook is one outbound notification endpoint (webhooks.go).
@@ -72,11 +74,13 @@ type Store struct {
 	Webhooks   []*Webhook         `json:"webhooks"`
 	Tenants    map[string]*Tenant `json:"tenants"`
 	CouncilPub []byte             `json:"council_pub,omitempty"` // FROST group key; trust anchor for recoveries
+	LogKey     []byte             `json:"log_key,omitempty"`     // CT log signing key (ed25519 seed, RFC 9162 STHs)
 	audit      []AuditEntry
 	started    time.Time
 	outbox     []webhookJob // durable delivery queue (webhooks.go); own file, not gateway.json
 	outboxOnce sync.Once
 	idem       map[string]idemEntry // Idempotency-Key replay cache (api.go), in-memory
+	apiLimiter *limiter             // per-token budget on the REST surface (ratelimit.go)
 }
 
 // SetCouncilPub installs the council FROST group key (trust anchor) and
@@ -99,7 +103,7 @@ func (s *Store) CouncilPublicKey() ed25519.PublicKey {
 // created once (gateway.key); a data-dir without one runs unencrypted
 // (legacy), which loadTenantTimeline tolerates.
 func NewStore(dir string) (*Store, error) {
-	s := &Store{dir: dir, Users: map[string]*User{}, Tenants: map[string]*Tenant{}, started: time.Now(), idem: map[string]idemEntry{}}
+	s := &Store{dir: dir, Users: map[string]*User{}, Tenants: map[string]*Tenant{}, started: time.Now(), idem: map[string]idemEntry{}, apiLimiter: newLimiter(apiRate, apiBurst)}
 	if err := os.MkdirAll(filepath.Join(dir, "tenants"), 0o700); err != nil {
 		return nil, err
 	}
@@ -143,6 +147,15 @@ func NewStore(dir string) (*Store, error) {
 		}
 	} else if !os.IsNotExist(err) {
 		return nil, err
+	}
+	if len(s.LogKey) != ed25519.SeedSize {
+		s.LogKey = make([]byte, ed25519.SeedSize)
+		if _, err := rand.Read(s.LogKey); err != nil {
+			return nil, err
+		}
+		if err := s.saveMeta(); err != nil {
+			return nil, err
+		}
 	}
 	return s, nil
 }

@@ -7,6 +7,9 @@ package trustorchestrator
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -505,4 +508,108 @@ func TestGatewayWebhookOutbox(t *testing.T) {
 
 	// non-loopback https webhook: delivered to a real endpoint is covered
 	// by the loopback path above; TLS wiring is cmd/gateway's job.
+}
+
+// TestCTEndpoints: the org's transparent log serves STHs and proofs a
+// reporter can verify, and gossip cross-checks a second STH against the
+// trusted one — the RFC 9162 audit loop over the HTTP API.
+func TestCTEndpoints(t *testing.T) {
+	dir := t.TempDir()
+	gw, admin := newTestGateway(t, dir)
+	srv := httptest.NewServer(gw.Handler())
+	defer srv.Close()
+
+	if resp := doJSON(t, srv, "POST", "/v1/orgs", admin, map[string]string{"name": "acme"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create org: %d", resp.StatusCode)
+	}
+	for i := 0; i < 6; i++ {
+		if resp := doJSON(t, srv, "POST", "/v1/orgs/acme/issue", admin,
+			map[string]any{"cert_id": fmt.Sprintf("c%d", i), "identity": "user"}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("issue %d: %d", i, resp.StatusCode)
+		}
+	}
+
+	sth := decode[map[string]any](t, doJSON(t, srv, "GET", "/v1/orgs/acme/ct/sth", admin, nil))
+	if sth["tree_size"].(float64) != 6 {
+		t.Fatalf("tree size: %v", sth["tree_size"])
+	}
+	logKey, _ := hex.DecodeString(sth["log_key_hex"].(string))
+	root, _ := hex.DecodeString(sth["root_hex"].(string))
+	sig, _ := hex.DecodeString(sth["signature_hex"].(string))
+	if !new(SignedTreeHead).Verify(ed25519.PublicKey(logKey)) &&
+		!(&SignedTreeHead{TreeSize: 6, Timestamp: int64(sth["timestamp"].(float64)), Root: root, Signature: sig}).Verify(ed25519.PublicKey(logKey)) {
+		t.Fatal("STH signature must verify under the served log key")
+	}
+
+	// inclusion proof against size 4 (a prefix): verify it by hand
+	inc := decode[map[string]any](t, doJSON(t, srv, "GET", "/v1/orgs/acme/ct/proof?index=2&size=4", admin, nil))
+	proofHex := inc["proof"].([]any)
+	proof := make([][]byte, len(proofHex))
+	for i, h := range proofHex {
+		proof[i], _ = hex.DecodeString(h.(string))
+	}
+	leaf, _ := hex.DecodeString(inc["leaf_hash_hex"].(string))
+	prefix := NewMerkleLog()
+	gw.mu.Lock()
+	for _, e := range gw.Tenants["acme"].tl.Events()[:4] {
+		prefix.Append(e.Hash())
+	}
+	gw.mu.Unlock()
+	if got := VerifyInclusion(leaf, 2, 4, proof); !bytes.Equal(got, prefix.Root()) {
+		var h []string
+		for _, e := range gw.Tenants["acme"].tl.Events()[:4] {
+			h = append(h, hex.EncodeToString(e.Hash()))
+		}
+		ev := gw.Tenants["acme"].tl.Events()
+		var dbg []string
+		for _, e := range ev {
+			dbg = append(dbg, fmt.Sprintf("%s@%d siglen=%d/%s", e.Type, e.Timestamp, len(e.Signature), hex.EncodeToString(e.Hash())))
+		}
+		t.Fatalf("served inclusion proof must verify against the prefix root: got %x want %x leaf %x prefixLeaves %v all %v", got, prefix.Root(), leaf, h, dbg)
+	}
+
+	// consistency 4 -> 6: must verify from the size-4 root to the size-6 STH
+	con := decode[map[string]any](t, doJSON(t, srv, "GET", "/v1/orgs/acme/ct/proof?from=4&to=6", admin, nil))
+	cproofHex := con["proof"].([]any)
+	cproof := make([][]byte, len(cproofHex))
+	for i, h := range cproofHex {
+		cproof[i], _ = hex.DecodeString(h.(string))
+	}
+	oldRoot, _ := hex.DecodeString(con["old_root_hex"].(string))
+	if !bytes.Equal(oldRoot, prefix.Root()) {
+		t.Fatal("served old_root must match the size-4 prefix root")
+	}
+	if !VerifyConsistency(oldRoot, root, 4, 6, cproof) {
+		t.Fatal("served consistency proof must verify 4 -> 6")
+	}
+
+	// gossip: feed the size-6 STH with the 4->6 proof; accepted, no alarm
+	gossip := decode[map[string]any](t, doJSON(t, srv, "POST", "/v1/orgs/acme/ct/gossip", admin, map[string]any{
+		"tree_size":     6,
+		"timestamp":     sth["timestamp"],
+		"root_b64":      base64.StdEncoding.EncodeToString(root),
+		"signature_b64": base64.StdEncoding.EncodeToString(sig),
+		"proof_from":    4,
+		"proof_hex":     con["proof"],
+	}))
+	if gossip["accepted"] != true {
+		t.Fatalf("gossip must accept the genuine STH: %v", gossip)
+	}
+
+	// a forked root at the same size (properly signed — the log itself
+	// trying to fork) must raise the split-brain alarm
+	forge := append([]byte(nil), root...)
+	forge[0] ^= 0xff
+	forgedSTH := SignSTH(ed25519.NewKeyFromSeed(gw.LogKey), forge, 6, time.Now().Unix())
+	gossip2 := decode[map[string]any](t, doJSON(t, srv, "POST", "/v1/orgs/acme/ct/gossip", admin, map[string]any{
+		"tree_size":     6,
+		"timestamp":     forgedSTH.Timestamp,
+		"root_b64":      base64.StdEncoding.EncodeToString(forge),
+		"signature_b64": base64.StdEncoding.EncodeToString(forgedSTH.Signature),
+		"proof_from":    6,
+		"proof_hex":     []string{},
+	}))
+	if gossip2["accepted"] == true || len(gossip2["alarm"].(string)) == 0 {
+		t.Fatal("forked root must be rejected with an alarm")
+	}
 }

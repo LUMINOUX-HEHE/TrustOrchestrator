@@ -27,6 +27,19 @@ All built on **Go stdlib only** — `crypto/ed25519`, `crypto/sha256`,
 No third-party crypto (nothing in `go.mod` beyond stdlib). That is itself
 the NFR4.2 compliance.
 
+## FIPS posture (disclosure)
+
+This codebase is **not** a FIPS 140-2/140-3 validated module and does not
+claim to be: none of its crypto carries CAVP certificates, and Go's
+`crypto/internal/fips140` (Go 1.24) is internal, not an app surface. What
+does hold: every primitive is FIPS-adjacent and stdlib-only — Ed25519
+(SP 800-186), SHA-256 / SHA3-256 (FIPS 180-4 / FIPS 202), AES-256-GCM
+(FIPS 197 / SP 800-38D), HKDF (SP 800-56C / SP 800-108), TLS 1.3
+(SP 800-52r2), ML-KEM-768 (FIPS 203), X.509 (SP 800-57). The library calls
+only `crypto/*` — never `crypto/internal/*` — so running it under a
+FIPS-validated Go runtime (the BoringCrypto or FIPS-enabled module builds)
+swaps the underlying module with no application change.
+
 ## Post-quantum (upgrade layer 2, landed)
 
 The council wire runs a per-connection hybrid handshake on top of mTLS:

@@ -430,12 +430,9 @@ func RemoteRecover(tl *Timeline, evidence *TrustEvent, groupPub ed25519.PublicKe
 		return nil, err
 	}
 	// the coordinator keeps the new epoch root; members never see it
-	defer zeroize(seed)
+	defer zeroBytes(seed)
 	council := &Council{epoch: lastEpoch(tl)}
 	fork, affected, identities, certDER, newPub, err := recoverRollback(tl, badIdx, seed, council.epoch, time.Now())
-	if err != nil {
-		return nil, err
-	}
 	if err != nil {
 		return nil, err
 	}
@@ -477,11 +474,9 @@ func RemoteRecover(tl *Timeline, evidence *TrustEvent, groupPub ed25519.PublicKe
 		resp, err := roundTripPQ(member, req)
 		member.Close()
 		if err != nil || len(resp.Share) == 0 {
-			fmt.Printf("DEBUG round2 %s: err=%v respErr=%q\n", ep.ServerName, err, resp.Error)
 			continue // member rejected the fork: recovery is not verified
 		}
 		if err := agg.AddShare(resp.Node, resp.Share); err != nil {
-			fmt.Printf("DEBUG addshare %s: %v\n", resp.Node, err)
 			continue // bad partial signature: drop this member
 		}
 		shares[resp.Node] = resp.Share
