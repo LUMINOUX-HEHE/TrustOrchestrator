@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orchestrator-config
+  namespace: {{ .Values.namespace.name }}
+data:
+  params.json: |
+    {{ .Values.watchdog.params | nindent 4 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: watchdog-events
+  namespace: {{ .Values.namespace.name }}
+data:
+  timeline.json: |
+    {{ .Values.watchdog.timeline | nindent 4 }}

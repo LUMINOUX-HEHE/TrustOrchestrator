@@ -12,8 +12,10 @@ The Trust Orchestrator is a self-hosted zero-trust networking stack whose core i
 distributed trust management system: a PKI that detects its own compromise, recovers
 autonomously, and can prove that both were done correctly. Detection is performed by an
 ensemble of five independent statistical watchdogs whose outputs are fused by quorum
-voting; recovery is executed by a five-node council holding Shamir shards of a backup
-root key; correctness is established through an event-sourced trust timeline, TLA+
+voting; recovery is executed by a five-node council holding FROST threshold
+signatures over a split root — the root key never exists, ≥3 members sign the
+epoch handoff; correctness is established through an event-sourced trust
+timeline, TLA+
 specification, and an adversarial benchmark called TrustOps that turns every system
 claim into a measured, reproducible result. A Trust Transparency Layer extends
 Certificate Transparency's public-audit idea from certificates to the entire
@@ -81,7 +83,7 @@ rather than incidental:
 - Replacing Certificate Transparency (CT remains complementary; this system publishes
   to CT logs).
 - Inventing cryptographic primitives (all are standard: Curve25519, AES-256, SHA-256,
-  Shamir secret sharing, Merkle trees).
+  FROST threshold signatures, Merkle trees).
 
 ### 1.4 Contribution Summary
 
@@ -188,7 +190,7 @@ primitives all exist; the orchestration does not.
                     │  ┌───────────────┐  ┌──────────────────────┐  │
                     │  │ Trust Timeline │  │  Recovery Council    │  │
                     │  │ (Merkle hash   │  │  (5 nodes, ≥3 vote, │  │
-                    │  │  chain,        │  │   Shamir shards)     │  │
+                    │  │  chain,        │  │   FROST shares)    │  │
                     │  │  forkable)     │  └──────────────────────┘  │
                     │  └───────────────┘                             │
                     │  ┌───────────────┐  ┌──────────────────────┐  │
@@ -217,14 +219,16 @@ primitives all exist; the orchestration does not.
 | Watchdogs | 5, separate hardware/software | ≥4 behave honestly (tolerates 1 Byzantine) |
 | Council | 5, physically distributed | ≥3 behave honestly for recovery |
 | Auditors | 5, different operators | Auditors are independent; escalation only, no execution (≥3 of 5 needed to escalate) |
-| Bootstrap | 1 offline key, 5 shards | Physical ceremony security |
+| Bootstrap | 1 offline key, 5 FROST shares | Physical ceremony security |
 
 ### 4.3 Key Distribution Flows
 
-1. Genesis: offline Ed25519 bootstrap key → 5 Shamir shards → council members.
+1. Genesis: offline Ed25519 root key → 5 FROST shares (dealer split or DKG)
+   → council members; the root never exists after the ceremony.
 2. Enrollment: each node presents a bootstrap-signed self-signed cert.
 3. Operations: council issues intermediate CA; identity server issues workload certs.
-4. Recovery: ≥3 shards → enclave → new intermediate (memory only) → zeroized.
+4. Recovery: ≥3 members threshold-sign the epoch handoff (no key
+   reconstruction) → new epoch root, coordinator-side only → zeroized.
 
 ---
 
@@ -317,8 +321,9 @@ operator.
 
 ### 5.4 Recovery Council
 
-**Setup:** 5 physically distributed nodes; each holds one Shamir shard (3-of-5) of the
-backup root key; each has a pre-bootstrapped identity (§5.7).
+**Setup:** 5 physically distributed nodes; each holds one FROST share
+(3-of-5) of the root — the root key never exists anywhere; each has a
+pre-bootstrapped identity (§5.7).
 
 **Recovery state machine:**
 
@@ -330,8 +335,8 @@ IDLE ──DETECTED+evidence──▶ VERIFY_EVIDENCE
   │                            │ ≥3 RECOVER? no → retry, widened evidence window
   │                            │ yes
   │                            ▼
-  │                      RECONSTRUCT   (≥3 shards → enclave, memory only)
-  │                            │
+  │                      THRESHOLD_SIGN (≥3 partial FROST signatures
+  │                            │         → epoch handoff; no reconstruction)
   │                            ▼
   │                      RE_ISSUE      (new intermediate CA signed)
   │                            │
@@ -392,7 +397,9 @@ minimal:
 
 1. One Ed25519 keypair generated on an air-gapped machine; the private key never
    touches a networked machine.
-2. The key is split into 5 Shamir shards, distributed on hardware tokens.
+2. The key is split via FROST into 5 shares (`FrostSplit`; keys signing
+   exactly what the root would sign), distributed on hardware tokens; the
+   root is destroyed at the end of the ceremony.
 3. The bootstrap public key is burned into each watchdog/council/auditor node.
 4. Nodes enroll once with bootstrap-signed self-signed certs.
 5. After genesis (≥3 council members enrolled, first intermediate issued), the
@@ -467,7 +474,7 @@ S6 post-condition instead of TLC — its evidence is (V + B), not (M).
 | Threat | Mitigation | Residual risk |
 |---|---|---|
 | 1 watchdog compromised | 5 watchdogs, ≥3 quorum | 2 simultaneous compromises (requires independent exploitation of different detector stacks) |
-| 1 council member compromised | 5 members, ≥3 vote, sharded key | 3 simultaneous compromises (physically distributed) |
+| 1 council member compromised | 5 members, ≥3 vote, FROST share | 3 simultaneous compromises (physically distributed) |
 | Network partition during recovery | Block until ≥3 connected | Extended asymmetric partition stalls (degrades to human) |
 | Verifier compromised | Cross-checked by ≥2 council members + auditors re-run checks | All verifier instances compromised (same deployment) |
 | Fork race during partition | Epoch monotonicity (attack eliminated) | Partitions with equal valid epochs (blocking, human resolves) |

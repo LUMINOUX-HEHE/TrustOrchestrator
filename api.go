@@ -4,20 +4,21 @@ package trustorchestrator
 // stdlib net/http ServeMux (Go 1.22+ method patterns), no framework.
 //
 //	POST /v1/users                    admin   create user -> token (shown once)
-//	POST /v1/users/{id}/tokens        admin   new token for a user
+//	POST /v1/users/{id}/tokens        admin   new token (optional per-token orgs scope)
 //	GET  /v1/users                    admin   list users
 //	POST /v1/orgs                     admin   create tenant (org)
 //	GET  /v1/orgs                     any     list visible orgs
 //	GET  /v1/orgs/{org}               scoped  tenant detail
 //	DELETE /v1/orgs/{org}             admin   delete tenant (files -> trash)
-//	GET  /v1/orgs/{org}/keys          admin   root seed for the shard ceremony
+//	GET  /v1/orgs/{org}/pubkey        scoped  org timeline verification key
 //	GET  /v1/orgs/{org}/timeline      scoped  events (filter/paginate)
 //	POST /v1/orgs/{org}/issue         op+     append ISSUE event
 //	POST /v1/orgs/{org}/revoke        op+     append REVOKE event
 //	GET  /v1/orgs/{org}/state         scoped  folded trust state
 //	GET  /v1/orgs/{org}/graph         scoped  trust graph
 //	POST /v1/orgs/{org}/scores        op+     watchdog score frame -> Detect
-//	POST /v1/orgs/{org}/recover       op+     council recovery (shards in body)
+//	POST /v1/orgs/{org}/recover       op+     apply council-authorized recovery fork
+//	GET  /v1/orgs/{org}/pubkey        scoped  org timeline verification key
 //	GET  /v1/audit                    aud+    search (timeline events, or actions)
 //	GET  /v1/webhooks                 admin   list webhooks
 //	POST /v1/webhooks                 admin   register webhook
@@ -28,16 +29,17 @@ package trustorchestrator
 //	GET  /v1/metrics                  viewer+ prometheus text
 //	GET  /v1/health                   none    liveness
 //
-// RBAC: role checks per route + org scoping (user.Orgs) for tenant routes.
-// Ponytail on recovery: the API path reconstructs the root from shards
-// in-process and signs the commit with ephemeral member keys — real
-// threshold signatures come from cmd/council over mTLS (councilnet.go).
-// VerifyRecovery post-conditions (P3/P5) still gate the result.
+// RBAC: role checks per route + org scoping (user.Orgs) + per-token org
+// scoping (TokenOrgs) for tenant routes; mutating POSTs honor
+// Idempotency-Key replay. Recovery is council-authorized end to end: the API holds only the
+// council's FROST group key (the trust anchor); shards/seeds never cross
+// this surface (the seed endpoint is gone). VerifyRecovery post-conditions
+// (P3/P5) are enforced by the council before the fork is produced.
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -81,6 +83,7 @@ func NewGateway(dir, bootstrapToken string) (*Store, string, error) {
 	for _, t := range s.Tenants {
 		s.watchOrg(t)
 	}
+	s.StartWebhookOutbox()
 	return s, token, nil
 }
 
@@ -95,7 +98,6 @@ func (s *Store) Handler() http.Handler {
 	s.route(mux, "GET /v1/orgs", nil, false, s.handleListOrgs)
 	s.route(mux, "GET /v1/orgs/{org}", nil, true, s.handleOrgDetail)
 	s.route(mux, "DELETE /v1/orgs/{org}", []string{RoleAdmin}, false, s.handleDeleteOrg)
-	s.route(mux, "GET /v1/orgs/{org}/keys", []string{RoleAdmin}, true, s.handleOrgKeys)
 	s.route(mux, "GET /v1/orgs/{org}/timeline", []string{RoleViewer, RoleAuditor, RoleOperator, RoleAdmin}, true, s.handleTimeline)
 	s.route(mux, "POST /v1/orgs/{org}/issue", []string{RoleOperator, RoleAdmin}, true, s.handleIssue)
 	s.route(mux, "POST /v1/orgs/{org}/revoke", []string{RoleOperator, RoleAdmin}, true, s.handleRevoke)
@@ -103,6 +105,7 @@ func (s *Store) Handler() http.Handler {
 	s.route(mux, "GET /v1/orgs/{org}/graph", []string{RoleViewer, RoleAuditor, RoleOperator, RoleAdmin}, true, s.handleGraph)
 	s.route(mux, "POST /v1/orgs/{org}/scores", []string{RoleOperator, RoleAdmin}, true, s.handleScores)
 	s.route(mux, "POST /v1/orgs/{org}/recover", []string{RoleOperator, RoleAdmin}, true, s.handleRecover)
+	s.route(mux, "GET /v1/orgs/{org}/pubkey", []string{RoleViewer, RoleAuditor, RoleOperator, RoleAdmin}, true, s.handleOrgPubKey)
 	s.route(mux, "GET /v1/audit", []string{RoleAuditor, RoleOperator, RoleAdmin}, false, s.handleAudit)
 	s.route(mux, "GET /v1/webhooks", []string{RoleAdmin}, false, s.handleListWebhooks)
 	s.route(mux, "POST /v1/webhooks", []string{RoleAdmin}, false, s.handleCreateWebhook)
@@ -114,13 +117,15 @@ func (s *Store) Handler() http.Handler {
 	return mux
 }
 
-// route wraps one handler with auth, role, org-scope, and audit middleware.
+// route wraps one handler with auth, role, org-scope, idempotency and
+// audit middleware.
 func (s *Store) route(mux *http.ServeMux, pattern string, roles []string, scoped bool, fn func(http.ResponseWriter, *http.Request, *Tenant)) {
 	mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
 		var u *User
+		var tokenHashStr string
 		if pattern != "GET /v1/health" {
 			var err error
-			u, err = s.authenticate(r)
+			u, tokenHashStr, err = s.authenticate(r)
 			if err != nil {
 				writeErr(w, http.StatusUnauthorized, err)
 				return
@@ -144,10 +149,24 @@ func (s *Store) route(mux *http.ServeMux, pattern string, roles []string, scoped
 				writeErr(w, http.StatusForbidden, fmt.Errorf("user %q not scoped to org %q", u.ID, org))
 				return
 			}
+			if u != nil && !u.tokenInOrg(tokenHashStr, org) {
+				writeErr(w, http.StatusForbidden, fmt.Errorf("token not scoped to org %q", org))
+				return
+			}
 		} else if u != nil {
 			r = r.WithContext(context.WithValue(r.Context(), userCtx{}, u))
 		}
-		rec := &responseRecorder{ResponseWriter: w}
+		rec := &responseRecorder{ResponseWriter: w, idem: s.idemKey(r)}
+		if rec.idem != "" {
+			if cached, ok := s.idemLookup(rec.idem); ok {
+				rec.header().Set("Content-Type", "application/json")
+				rec.WriteHeader(cached.status)
+				rec.Write(cached.body)
+				s.Audit(AuditEntry{Ts: time.Now().Unix(), User: userID(u), Org: r.PathValue("org"),
+					Method: r.Method, Path: r.URL.Path, Status: cached.status, Details: "idempotent replay"})
+				return
+			}
+		}
 		func() {
 			defer func() {
 				if p := recover(); p != nil {
@@ -156,6 +175,9 @@ func (s *Store) route(mux *http.ServeMux, pattern string, roles []string, scoped
 			}()
 			fn(rec, r, t)
 		}()
+		if rec.idem != "" {
+			s.idemStore(rec.idem, rec.status, rec.buf)
+		}
 		s.Audit(AuditEntry{Ts: time.Now().Unix(), User: userID(u), Org: r.PathValue("org"),
 			Method: r.Method, Path: r.URL.Path, Status: rec.status})
 	})
@@ -164,6 +186,12 @@ func (s *Store) route(mux *http.ServeMux, pattern string, roles []string, scoped
 type responseRecorder struct {
 	http.ResponseWriter
 	status int
+	buf    []byte
+	idem   string // Idempotency-Key, empty = cache nothing
+}
+
+func (r *responseRecorder) header() http.Header {
+	return r.ResponseWriter.Header()
 }
 
 func (r *responseRecorder) WriteHeader(code int) {
@@ -177,7 +205,54 @@ func (r *responseRecorder) Write(b []byte) (int, error) {
 	if r.status == 0 {
 		r.status = http.StatusOK
 	}
+	r.buf = append(r.buf, b...)
 	return r.ResponseWriter.Write(b)
+}
+
+// idemEntry caches one idempotent response for replay (key -> 24h window).
+type idemEntry struct {
+	status int
+	body   []byte
+	ts     int64
+}
+
+// idemKey derives the replay key: method|path|token-user|hash(body). The
+// token identity keeps one client's replay from serving another's result.
+func (s *Store) idemKey(r *http.Request) string {
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" || (r.Method != "POST" && r.Method != "PUT") {
+		return ""
+	}
+	body, _ := io.ReadAll(r.Body)
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	u := ""
+	if usr, ok := r.Context().Value(userCtx{}).(*User); ok {
+		u = usr.ID
+	}
+	return sha256Hex([]byte(r.Method + "|" + r.URL.Path + "|" + u + "|" + key + "|" + string(body)))
+}
+
+func (s *Store) idemLookup(key string) (idemEntry, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.idem[key]
+	if ok && time.Now().Unix()-e.ts > 24*3600 {
+		delete(s.idem, key)
+		return idemEntry{}, false
+	}
+	return e, ok
+}
+
+func (s *Store) idemStore(key string, status int, body []byte) {
+	if key == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.idem) > 4096 {
+		s.idem = map[string]idemEntry{} // ponytail: blunt; LRU if this ever matters
+	}
+	s.idem[key] = idemEntry{status: status, body: append([]byte(nil), body...), ts: time.Now().Unix()}
 }
 
 func userID(u *User) string {
@@ -199,19 +274,20 @@ func hasRole(role string, want []string) bool {
 	return false
 }
 
-func (s *Store) authenticate(r *http.Request) (*User, error) {
+func (s *Store) authenticate(r *http.Request) (*User, string, error) {
 	raw, err := BearerToken(r.Header.Get("Authorization"))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
+	hash := tokenHash(raw)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, u := range s.Users {
 		if u.Authed(raw) {
-			return u, nil
+			return u, hash, nil
 		}
 	}
-	return nil, errors.New("invalid token")
+	return nil, "", errors.New("invalid token")
 }
 
 // ---------- handlers ----------
@@ -267,6 +343,18 @@ func (s *Store) handleListUsers(w http.ResponseWriter, r *http.Request, t *Tenan
 
 func (s *Store) handleUserToken(w http.ResponseWriter, r *http.Request, t *Tenant) {
 	id := r.PathValue("id")
+	var req struct {
+		Orgs []string `json:"orgs,omitempty"` // optional per-token scope subset
+	}
+	if r.Body != nil {
+		b, _ := io.ReadAll(io.LimitReader(r.Body, maxBody))
+		if len(b) > 0 {
+			if err := json.Unmarshal(b, &req); err != nil {
+				writeErr(w, http.StatusBadRequest, err)
+				return
+			}
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	u := s.Users[id]
@@ -274,7 +362,7 @@ func (s *Store) handleUserToken(w http.ResponseWriter, r *http.Request, t *Tenan
 		writeErr(w, http.StatusNotFound, fmt.Errorf("no such user %q", id))
 		return
 	}
-	raw, err := u.NewToken()
+	raw, err := u.NewToken(req.Orgs...)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -283,7 +371,7 @@ func (s *Store) handleUserToken(w http.ResponseWriter, r *http.Request, t *Tenan
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"id": u.ID, "token": raw})
+	writeJSON(w, http.StatusCreated, map[string]any{"id": u.ID, "token": raw, "orgs": req.Orgs})
 }
 
 type createOrgReq struct {
@@ -367,13 +455,12 @@ func (s *Store) handleDeleteOrg(w http.ResponseWriter, r *http.Request, t *Tenan
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": r.PathValue("org")})
 }
 
-func (s *Store) handleOrgKeys(w http.ResponseWriter, r *http.Request, t *Tenant) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	seed := t.tl.key.Seed()
+// handleOrgPubKey exposes the org timeline's verification key (public only —
+// the seed-over-API endpoint is gone; the shard ceremony no longer needs
+// it since the council FROST shares are independent of the org root).
+func (s *Store) handleOrgPubKey(w http.ResponseWriter, r *http.Request, t *Tenant) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"org": t.ID, "seed_b64": base64.StdEncoding.EncodeToString(seed),
-		"ceremony": "to shard --key <seedfile> --shares 5 --threshold 3",
+		"org": t.ID, "pubkey_hex": hex.EncodeToString(t.tl.Pub()),
 	})
 }
 
@@ -547,59 +634,87 @@ func (s *Store) handleScores(w http.ResponseWriter, r *http.Request, t *Tenant) 
 }
 
 type recoverReq struct {
-	Shards []*Shard `json:"shards"`
+	Timeline json.RawMessage `json:"timeline"` // the council-produced recovery fork
+	Commit   *FrostCommit    `json:"commit"`   // the threshold-signed handoff (also inside the fork)
 }
 
-// handleRecover runs the council recovery with shards supplied by the
-// operator (3 of the 5 ceremony shards). Evidence = the latest DETECTED
-// event on the org's timeline.
+// handleRecover applies a council-authorized recovery fork. The operator
+// submits the council's output (fork + handoff); the API verifies the
+// handoff against the council FROST group key, the fork's chain integrity,
+// and that the fork descends from THIS org's verified prefix before
+// adopting it. No shards or seeds ever cross this surface.
 func (s *Store) handleRecover(w http.ResponseWriter, r *http.Request, t *Tenant) {
 	var req recoverReq
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if len(req.Shards) < quorum {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("need >= %d shards", quorum))
+	if req.Commit == nil || len(req.Timeline) == 0 {
+		writeErr(w, http.StatusBadRequest, errors.New("timeline and commit required"))
 		return
 	}
-	s.mu.Lock()
-	evidence, err := lastDetected(t)
-	if err != nil {
-		s.mu.Unlock()
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	members := make([]*CouncilMember, len(req.Shards))
-	for i, sh := range req.Shards {
-		_, k, kerr := ed25519.GenerateKey(rand.Reader)
-		if kerr != nil {
-			s.mu.Unlock()
-			writeErr(w, http.StatusInternalServerError, kerr)
-			return
+	// verify and adopt under the lock; webhooks and the response must not
+	// run here — FireWebhooks takes s.mu itself (deadlocks otherwise).
+	fork, code, err := func() (*Timeline, int, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if len(s.CouncilPub) != ed25519.PublicKeySize {
+			return nil, http.StatusUnprocessableEntity, errors.New("council trust anchor not configured")
 		}
-		members[i] = &CouncilMember{ID: fmt.Sprintf("shard-%d", i+1), Key: k, Shard: sh}
-	}
-	rep, err := NewCouncil(members).Recover(t.tl, evidence, quorum)
+		if !req.Commit.Valid(s.CouncilPub, quorum) {
+			return nil, http.StatusUnprocessableEntity, errors.New("handoff signature invalid")
+		}
+		fork, err := UnmarshalTimeline(req.Timeline)
+		if err != nil {
+			return nil, http.StatusUnprocessableEntity, fmt.Errorf("bad fork: %w", err)
+		}
+		if !fork.Verify() {
+			return nil, http.StatusUnprocessableEntity, errors.New("fork chain verification failed")
+		}
+		// the handoff must be present and be the fork's branch point
+		idx := -1
+		for i, e := range fork.Events() {
+			if e.Type == EvRecovery {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return nil, http.StatusUnprocessableEntity, errors.New("fork has no recovery handoff")
+		}
+		// the fork must descend from THIS org's verified prefix: events before
+		// the handoff are exactly our chain's events (the compromised region
+		// beyond the checkpoint is what recovery replaces).
+		cur := t.tl.Events()
+		if len(cur) < idx {
+			return nil, http.StatusUnprocessableEntity, errors.New("fork does not descend from this org's timeline")
+		}
+		for i := 0; i < idx; i++ {
+			if !bytes.Equal(cur[i].Hash(), fork.Events()[i].Hash()) {
+				return nil, http.StatusUnprocessableEntity, errors.New("fork prefix mismatch")
+			}
+		}
+		// epochs must advance monotonically (no replay of a stale recovery)
+		if lastEpoch(fork) <= lastEpoch(t.tl) {
+			return nil, http.StatusUnprocessableEntity, errors.New("fork epoch does not advance")
+		}
+		t.tl = fork
+		t.detected = false
+		t.counters["recoveries"]++
+		if err := s.saveTenant(t); err != nil {
+			return nil, http.StatusInternalServerError, err
+		}
+		return fork, 0, nil
+	}()
 	if err != nil {
-		s.mu.Unlock()
-		writeErr(w, http.StatusUnprocessableEntity, fmt.Errorf("recovery blocked: %w", err))
+		writeErr(w, code, err)
 		return
 	}
-	t.tl = rep.Timeline
-	t.detected = false
-	t.counters["recoveries"]++
-	if err := s.saveTenant(t); err != nil {
-		s.mu.Unlock()
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	s.mu.Unlock()
-	s.FireWebhooks(t.ID, HookRecovery, rep.Timeline.Head(), map[string]any{
-		"epoch": rep.Commit.Epoch, "issued": rep.Issued, "verify": rep.Verify.Pass()})
+	s.FireWebhooks(t.ID, HookRecovery, fork.Head(), map[string]any{
+		"epoch": req.Commit.Epoch, "issued": len(req.Commit.Members)})
 	writeJSON(w, http.StatusOK, map[string]any{
-		"org": t.ID, "epoch": rep.Commit.Epoch, "issued": rep.Issued,
-		"verify": rep.Verify.Pass(), "head": hex.EncodeToString(rep.Timeline.Head())})
+		"org": t.ID, "epoch": req.Commit.Epoch, "issued": len(req.Commit.Members),
+		"head": hex.EncodeToString(fork.Head())})
 }
 
 func lastDetected(t *Tenant) (*TrustEvent, error) {
@@ -676,8 +791,16 @@ func (s *Store) handleCreateWebhook(w http.ResponseWriter, r *http.Request, t *T
 		return
 	}
 	u, err := url.Parse(req.URL)
-	if err != nil || u.Scheme != "https" && u.Scheme != "http" {
-		writeErr(w, http.StatusBadRequest, errors.New("url must be http(s)"))
+	if err != nil || u.Scheme != "https" {
+		// ponytail: loopback http only for local sinks (tests/dev);
+		// everything else must be TLS. The outbox retries over the wire.
+		if !(u != nil && u.Scheme == "http" && (u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" || u.Hostname() == "::1")) {
+			writeErr(w, http.StatusBadRequest, errors.New("webhook url must be https (or http on loopback)"))
+			return
+		}
+	}
+	if u == nil {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid url"))
 		return
 	}
 	s.mu.Lock()

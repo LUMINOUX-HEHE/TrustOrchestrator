@@ -111,6 +111,50 @@ func TestEnsembleQuorum(t *testing.T) {
 	}
 }
 
+func TestKeyRotationVerifiesAcrossFork(t *testing.T) {
+	_, k1, _ := ed25519.GenerateKey(rand.Reader)
+	tl := NewTimeline(k1)
+	tl.Append(EvIssue, []byte(`{"cert_id":"c1","identity":"dev"}`), 1)
+	tl.Append(EvIssue, []byte(`{"cert_id":"c2","identity":"ops"}`), 2)
+	ck, _ := tl.Append(EvIssue, []byte(`{"cert_id":"c3","identity":"fix"}`), 3)
+	_, k2, _ := ed25519.GenerateKey(rand.Reader)
+	if _, err := tl.RotateKey(k2, 4); err != nil {
+		t.Fatal(err)
+	}
+	tl.Append(EvIssue, []byte(`{"cert_id":"c4","identity":"post-rotate"}`), 5)
+	if !tl.Verify() {
+		t.Fatal("rotated chain failed verify")
+	}
+	// fork at a point signed by the OLD key: fork must start on k1
+	fork, err := tl.Fork(ck)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fork.Append(EvIssue, []byte(`{"cert_id":"c5","identity":"fork-old-key"}`), 6); err != nil {
+		t.Fatal(err)
+	}
+	if !fork.Verify() {
+		t.Fatal("fork started on wrong key")
+	}
+	// save/load round-trip keeps verification working
+	b, err := tl.Marshal(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := UnmarshalTimeline(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.Verify() {
+		t.Fatal("loaded rotated timeline failed verify")
+	}
+	// tamper an event signed by the NEW key: still caught
+	tl.events[len(tl.events)-1].Payload[0] = 'X'
+	if tl.Verify() {
+		t.Fatal("tampered rotated chain passed verify")
+	}
+}
+
 func TestLocateBadEvent(t *testing.T) {
 	_, key, _ := ed25519.GenerateKey(rand.Reader)
 	tl := NewTimeline(key)

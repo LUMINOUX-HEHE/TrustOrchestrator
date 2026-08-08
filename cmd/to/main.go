@@ -246,7 +246,9 @@ func parseConfig(path string) (map[string]string, error) {
 }
 
 // shard accepts the deployment-guide flag form (--key/--shares/--threshold)
-// and the positional form (<keyfile> <n> <k>).
+// and the positional form (<keyfile> <n> <k>). Dealer-mode FROST: the root
+// splits into n t-of-n shares (same files `to-council recover` and
+// `to-council serve` load); the seed never appears in any share file.
 func shard(args []string) error {
 	keyFile, n, k, err := parseShardArgs(args)
 	if err != nil {
@@ -260,20 +262,26 @@ func shard(args []string) error {
 	if err != nil {
 		return err
 	}
-	shards, err := to.ShamirSplit(seed, n, k)
+	signers, groupPub, err := to.FrostSplit(seed, n, k)
 	if err != nil {
 		return err
 	}
-	for i, s := range shards {
-		b, err := s.Marshal()
+	for _, s := range signers {
+		file := to.FrostShareFile{ID: s.ID, X: s.X, Y: s.Share,
+			GroupPub: s.GroupPub, PubShare: s.PubShare}
+		for _, c := range s.VK {
+			file.VK = append(file.VK, hex.EncodeToString(to.EncodePoint(c)))
+		}
+		b, err := file.Marshal()
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(fmt.Sprintf("shard-%d.json", i+1), b, 0o600); err != nil {
+		if err := os.WriteFile(fmt.Sprintf("share-%s.json", s.ID), b, 0o600); err != nil {
 			return err
 		}
 	}
-	fmt.Printf("wrote %d shards (k=%d of n=%d) to shard-*.json\n", n, k, n)
+	fmt.Printf("wrote %d FROST shares (threshold %d of %d) to share-*.json\n", n, k, n)
+	fmt.Printf("GROUP KEY (gateway --council-pub): %s\n", hex.EncodeToString(groupPub))
 	return nil
 }
 

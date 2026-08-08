@@ -6,7 +6,8 @@ End-to-end walkthrough of a real security event. Commands are the shippable CLIs
 
 ```
 to-tool genkey bootstrap.key                 # offline root (Ed25519)
-to-tool shard --key bootstrap.key --shares 5 --threshold 3   → shard-1..5
+to-tool shard --key bootstrap.key --shares 5 --threshold 3   → share-M1..M5 (FROST)
+# the printed GROUP KEY becomes the gateway's public trust anchor
 # enroll each node with bootstrap (short-form or config file):
 to-watchdog enroll --bootstrap bootstrap.key --node-id W1 --role watchdog
 to-council  enroll --bootstrap bootstrap.key --node-id C1 --role council
@@ -51,8 +52,9 @@ to-orchestrator rollback --dry-run --events evidence.json
   would invalidate 6 cert(s) …
 ```
 
-Real execute path: council reconstruction (3-of-5 Shamir) + signed RECOVER
-votes (`council.go`), then:
+Real execute path: ≥3 council members threshold-sign the epoch handoff
+(3-of-5 FROST, `council.go` / `frost.go`; the root key never exists), next
+run then:
 1. fork the timeline at the latest **verified good** checkpoint
 2. invalidate = reachable subgraph from the first bad event (`graph.go`)
 3. re-issue fresh certs for damaged identities onto the new canonical fork

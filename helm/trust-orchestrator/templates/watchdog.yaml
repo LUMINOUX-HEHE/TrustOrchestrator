@@ -1,0 +1,58 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: to-watchdog
+  namespace: {{ .Values.namespace.name }}
+spec:
+  clusterIP: None
+  selector: {app: to-watchdog}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: to-watchdog
+  namespace: {{ .Values.namespace.name }}
+spec:
+  serviceName: to-watchdog
+  replicas: {{ .Values.watchdog.replicas }}
+  selector:
+    matchLabels: {app: to-watchdog}
+  template:
+    metadata:
+      labels: {app: to-watchdog, role: watchdog}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 65534}
+      volumes:
+        - name: ca
+          secret: {secretName: identity-ca}
+        - name: node-tls
+          secret: {secretName: watchdog-node}
+        - name: podinfo
+          downwardAPI:
+            items:
+              - {path: name, fieldRef: {fieldPath: metadata.name}}
+        - name: events
+          configMap: {name: watchdog-events}
+        - name: orchestrator-config
+          configMap: {name: orchestrator-config}
+      containers:
+        - name: watchdog
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/to-watchdog", "run"]
+          args:
+            - --events=/events/timeline.json
+            - --params=/config/params.json
+            - --kind={{ .Values.watchdog.kind }}
+            - --node-id-file=/etc/podinfo/name
+            - --live=orchestrator:8333
+            - --server-name=orchestrator
+            - --ca=/ca/ca.der
+            - --cert=/tls/leaf.der
+            - --key=/tls/node.key
+          volumeMounts:
+            - {name: ca, mountPath: /ca, readOnly: true}
+            - {name: node-tls, mountPath: /tls, readOnly: true}
+            - {name: podinfo, mountPath: /etc/podinfo, readOnly: true}
+            - {name: events, mountPath: /events, readOnly: true}
+            - {name: orchestrator-config, mountPath: /config, readOnly: true}

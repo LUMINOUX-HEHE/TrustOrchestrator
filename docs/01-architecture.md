@@ -7,7 +7,7 @@
 | Trust timeline | `timeline.go`, `graph.go` | Append-only Merkle chain; every rollback is a **fork** at a verified checkpoint |
 | Watchdog ensemble | `watchdogs.go`, `detect.go`, `ensemble.go` | 5 independent detectors → scores → DETECTED iff ≥3/5 below threshold |
 | Trust transparency | `audit.go` | Auditor mirror of every event; auditors escalate, never recover |
-| Recovery council | `council.go`, `shamir.go` | 3-of-5 Shamir shards of the backup root; ≥3 signed RECOVER votes |
+| Recovery council | `council.go`, `frost.go` | 3-of-5 FROST threshold signatures on the epoch handoff; ≥3 members sign, the root key never exists |
 | Time-travel rollback | `rollback.go`, `consumer.go` | Re-fold verified prefix; invalidate reachable set; push delta |
 
 ## Data flow (normal cycle)
@@ -53,7 +53,8 @@ DETECTED(A) = #{ nodes : Score < threshold } ≥ quorum
 
 ## Recovery flow
 
-1. Council votes (≥3 of 5) → secret re-constructed (`shamir.go`, `zeroize` after)
+1. Council threshold-signs the epoch handoff (≥3 of 5 FROST shares; the
+   root key never exists anywhere — `frost.go`, no reconstruction step)
 2. Fork at last verified good checkpoint (highest-valid epoch wins, FR4.4)
 3. Invalidation set = reachable subgraph from first bad event (BFS over
    `graph.go` edges) — minimal blast radius L4
@@ -62,9 +63,9 @@ DETECTED(A) = #{ nodes : Score < threshold } ≥ quorum
 
 The recovery state machine (council.go) is shared by the in-process path and
 the networked protocol (councilnet.go): `to-council serve` members hold the
-shards and answer VOTE / COMMIT_REQ over mTLS — the initiator never sees
-member keys, members re-verify P3/P5 before signing the epoch descriptor, and
-≥3 valid member signatures form the COMMIT.
+FROST shares and answer VOTE / COMMIT_REQ over mTLS — the initiator never sees
+member secrets, members re-verify P3/P5 before signing the epoch descriptor,
+and ≥3 valid partial signatures form the COMMIT.
 
 ## Transport
 

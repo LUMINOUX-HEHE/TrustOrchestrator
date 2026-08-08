@@ -13,7 +13,8 @@ Every source file, its job, key functions, and how it's tested.
 | `audit.go` | auditor mirror, policy check, escalation | `Mirror`, `Verify`, `CheckPolicy`, `DetectEscalated` |
 | `council.go` | recovery council, votes, permissions | `Recover`, `SignCommit`, `recoverFork`, `finishRecovery` |
 | `councilnet.go` | networked council protocol (two rounds over mTLS) | `RemoteRecover`, `CouncilMemberServer`, `MemberEndpoint` |
-| `shamir.go` | Shamir secret sharing 3-of-5 | `Split`, `Reconstruct` |
+| `frost.go` | FROST threshold signing (dealer split + DKG + share files) | `FrostSplit`, `DkgCeremony`, `FrostShareFile`, `FrostAggregator` |
+| `shamir.go` | legacy Shamir split/join (shard CLI predecessor) | `ShamirSplit`, `ShamirJoin` |
 | `rollback.go` | refold to checkpoint, invalidation set | `Rollback`, `invalidateReachable` |
 | `graph.go` | trust graph + scoped reachability | `InvalidationSetScoped` |
 | `consumer.go` | consumer rules engine (delta application) | `ApplyDelta`; `consumerState` |
@@ -29,7 +30,7 @@ Every source file, its job, key functions, and how it's tested.
 |---|---|---|
 | `cmd/to` | `to-tool` (base: genkey,shard,enroll,bench) + `to-bench` + `to-watchdog` (enroll/run) | the Swiss-army CLI, dispatch by argv[0] |
 | `cmd/orchestrator` | `to-orchestrator status / timeline / verify / graph / policy reload / rollback --dry-run` | reads event files |
-| `cmd/council` | `to-council serve` (networked member node) + `recover` (shard files) | member node: shard + mTLS; recover: share files |
+| `cmd/council` | `to-council serve` (networked member node) + `recover` (share files) | member node: FROST share + mTLS; recover: share files |
 | `cmd/auditor` | `to-auditor audit --log` | mirror log checker |
 | `cmd/identity` | `to-identity ca / issue / revoke / crl / verify` | CA + CRL issuance, revocation, inspection |
 | `cmd/pdp` | `to-pdp check --policy --events` | policy decision point |

@@ -34,9 +34,9 @@ proves it, and the result.
 **FR4 Recovery council**
 | Requirement | Implementation | Test | Result |
 |---|---|---|---|
-| FR4.1 5 shards, 3-of-5 | `shamir.go` | `TestShamirRoundtrip, WrongShard` | PASS |
-| FR4.2 ≥3 RECOVER votes | `council.go` | `TestRecoveryEndToEnd` | PASS |
-| FR4.3 enclave, memory-only | `council.go zeroize` | PARTIAL (no real SGX) | PARTIAL |
+| FR4.1 5 shares, 3-of-5 | `frost.go`, `FrostSplit` | `TestFrostSelfCheck`, `TestFrostSubsets` | PASS |
+| FR4.2 ≥3 signature quorum | `council.go` `SignCommit` | `TestRecoveryEndToEnd` | PASS |
+| FR4.3 no root, memory-only | `frost.go` (root never exists) + `zeroize` | PARTIAL (no real SGX) | PARTIAL |
 | FR4.4 canonical fork | `EpochCommitValidity` | `TestEpochCommitValidity` | PASS |
 | FR4.5 single member can't | quorum | `TestK*.Recovery` | PASS |
 
@@ -58,7 +58,7 @@ proves it, and the result.
 **FR8 Bootstrap**
 | Requirement | Implementation | Test | Result |
 |---|---|---|---|
-| FR8.1 one key, 5 shards, ceremony | `genkey/shard/enroll` | `TestEnroll, TestEnrollNodeIDForm` | PASS |
+| FR8.1 one key, 5 shares, ceremony | `genkey/shard/enroll` | `TestEnroll, TestEnrollNodeIDForm` | PASS |
 | FR8.2 bootstrap revoked after genesis | `revoke` + marker | `TestBootstrapRevokedAfterGenesis` | PASS |
 | FR8.3 independent auditor roots | `enroll --role auditor` | foreign-root verify in TestEnroll | PASS |
 

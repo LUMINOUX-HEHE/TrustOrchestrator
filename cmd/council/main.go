@@ -1,14 +1,15 @@
 package main
 
 // to-council: council member node + manual recovery trigger (deployment
-// guide §9). `serve` runs a persistent networked member (councilnet.go)
-// holding one Shamir shard; `recover` reconstructs from >=3 shard files
-// (from `to-tool shard`) and a DETECTED evidence file (from
-// `to-tool bench run --out reports` -> reports/evidence.json).
+// guide §9). `dkg` runs the one-time ceremony (5 members, threshold 3) and
+// writes one FROST share file per member; `serve` runs a persistent
+// networked member holding one share; `recover` drives an in-process
+// threshold recovery from >=3 share files and a DETECTED evidence file
+// (from `to-tool bench run --out reports` -> reports/evidence.json).
+// The root key never exists anywhere on this path.
 
 import (
 	"crypto/ed25519"
-	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
@@ -32,6 +33,8 @@ func main() {
 	}
 	var err error
 	switch args[0] {
+	case "dkg":
+		err = dkgCmd(args[1:])
 	case "recover":
 		err = recoverCmd(args[1:])
 	case "serve":
@@ -47,12 +50,17 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  to-council serve --id <C1> --addr <host:port> --shard <s.json> --ca <ca.der> --cert <leaf.der> --key <node.key>
-    persistent networked member: answers VOTE (shard only on clean prefix)
-    and COMMIT_REQ (signature only after P3/P5 re-verification) over mTLS
-  to-council recover --evidence <file> --shards <s1.json> <s2.json> <s3.json> [--out <dir>]
+  to-council dkg --members <n> --threshold <k> --out <dir>
+    one-time ceremony: writes share-1.json..share-n.json (FROST shares;
+    the root never exists) and prints the council group key (the gateway's
+    recovery trust anchor)
+  to-council serve --id <C1> --addr <host:port> --share <s.json> --epoch <f> --ca <ca.der> --cert <leaf.der> --key <node.key>
+    persistent networked member: answers VOTE (commitment only on clean
+    prefix) and COMMIT_REQ (partial signature only after P3/P5 re-check)
+    over mTLS; <f> persists the last committed epoch
+  to-council recover --evidence <file> --shares <s1.json> <s2.json> <s3.json> [--out <dir>]
     <file>: DETECTED evidence (reports/evidence.json from the benchmark)
-    <sN.json>: Shamir shard files (>= 3) from 'to-tool shard'`)
+    <sN.json>: FROST share files (>= 3) from 'to-council dkg'`)
 	os.Exit(1)
 }
 
@@ -67,22 +75,84 @@ func flags(args []string) map[string]string {
 	return f
 }
 
-// serveCmd runs one council member node: mTLS listener, one shard, node key
-// from `to-identity issue --key-out` (64-byte hex) or a 32-byte seed.
-func serveCmd(args []string) error {
+// dkgCmd runs the one-time FROST ceremony and writes one share file per
+// member (mode 0600). The group key is printed for the gateway's
+// --council-pub trust anchor.
+func dkgCmd(args []string) error {
 	f := flags(args)
-	for _, k := range []string{"id", "addr", "shard", "ca", "cert", "key"} {
-		if f[k] == "" {
-			return errors.New("usage: serve --id <C1> --addr <host:port> --shard <s.json> --ca <ca.der> --cert <leaf.der> --key <node.key>")
-		}
+	if f["members"] == "" || f["threshold"] == "" || f["out"] == "" {
+		return errors.New("usage: dkg --members <n> --threshold <k> --out <dir>")
 	}
-	b, err := os.ReadFile(f["shard"])
+	n := mustInt(f["members"])
+	k := mustInt(f["threshold"])
+	if k < 2 || k > n {
+		return errors.New("need 2 <= threshold <= members")
+	}
+	signers, groupPub, err := to.DkgCeremony(n, k)
 	if err != nil {
 		return err
 	}
-	var s to.Shard
-	if err := json.Unmarshal(b, &s); err != nil {
-		return fmt.Errorf("shard: %w", err)
+	if err := os.MkdirAll(f["out"], 0o700); err != nil {
+		return err
+	}
+	for _, s := range signers {
+		file := to.FrostShareFile{ID: s.ID, X: s.X, Y: s.Share,
+			GroupPub: s.GroupPub, PubShare: s.PubShare, GlobalVK: s.GlobalVK}
+		b, err := file.Marshal()
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(fmt.Sprintf("%s/share-%s.json", f["out"], s.ID), b, 0o600); err != nil {
+			return err
+		}
+	}
+	fmt.Printf("wrote %d FROST shares to %s (threshold %d of %d)\n", n, f["out"], k, n)
+	fmt.Printf("GROUP KEY (gateway --council-pub): %s\n", hex.EncodeToString(groupPub))
+	fmt.Println("distribute one share file per council member machine; the root never existed")
+	return nil
+}
+
+func mustInt(s string) int {
+	var n int
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return 0
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n
+}
+
+// loadShare reads one FROST share file into a signing participant.
+func loadShare(path string) (*to.FrostSigner, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var f to.FrostShareFile
+	if err := json.Unmarshal(b, &f); err != nil {
+		return nil, fmt.Errorf("share %s: %w", path, err)
+	}
+	s, err := f.Signer()
+	if err != nil {
+		return nil, fmt.Errorf("share %s: %w", path, err)
+	}
+	return s, nil
+}
+
+// serveCmd runs one council member node: mTLS listener, one FROST share,
+// node key from `to-identity issue --key-out` (64-byte hex) or a 32-byte
+// seed.
+func serveCmd(args []string) error {
+	f := flags(args)
+	for _, k := range []string{"id", "addr", "share", "ca", "cert", "key"} {
+		if f[k] == "" {
+			return errors.New("usage: serve --id <C1> --addr <host:port> --share <s.json> --epoch <f> --ca <ca.der> --cert <leaf.der> --key <node.key>")
+		}
+	}
+	signer, err := loadShare(f["share"])
+	if err != nil {
+		return err
 	}
 	raw, err := os.ReadFile(f["key"])
 	if err != nil {
@@ -109,13 +179,13 @@ func serveCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	srv := to.NewCouncilMemberServer(f["id"], &s, key, cfg)
-	fmt.Printf("council member %s listening on %s (shard %s, mTLS)\n", f["id"], f["addr"], f["shard"])
+	srv := to.NewCouncilMemberServer(f["id"], signer, key, cfg, f["epoch"])
+	fmt.Printf("council member %s listening on %s (share %s, mTLS)\n", f["id"], f["addr"], f["share"])
 	return srv.Serve(ln)
 }
 
 // keyFromFile accepts the genkey format (full 64-byte ed25519 private key)
-// or a 32-byte seed (ShamirJoin output) — both hex-encoded.
+// or a 32-byte seed — both hex-encoded.
 func keyFromFile(b []byte) ed25519.PrivateKey {
 	if len(b) == 64 {
 		return ed25519.PrivateKey(b)
@@ -125,7 +195,7 @@ func keyFromFile(b []byte) ed25519.PrivateKey {
 
 func recoverCmd(args []string) error {
 	evidencePath, outDir := "", ""
-	var shardPaths []string
+	var sharePaths []string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--evidence":
@@ -133,9 +203,9 @@ func recoverCmd(args []string) error {
 				evidencePath = args[i+1]
 				i++
 			}
-		case "--shards":
+		case "--shares":
 			for i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
-				shardPaths = append(shardPaths, args[i+1])
+				sharePaths = append(sharePaths, args[i+1])
 				i++
 			}
 		case "--out":
@@ -145,13 +215,13 @@ func recoverCmd(args []string) error {
 			}
 		}
 	}
-	if evidencePath == "" || len(shardPaths) < 3 {
-		return errors.New("usage: recover --evidence <file> --shards <s1.json> <s2.json> <s3.json> [--out <dir>]")
+	if evidencePath == "" || len(sharePaths) < 3 {
+		return errors.New("usage: recover --evidence <file> --shares <s1.json> <s2.json> <s3.json> [--out <dir>]")
 	}
-	return recover(evidencePath, shardPaths, outDir)
+	return recover(evidencePath, sharePaths, outDir)
 }
 
-func recover(evidencePath string, shardPaths []string, outDir string) error {
+func recover(evidencePath string, sharePaths []string, outDir string) error {
 	raw, err := os.ReadFile(evidencePath)
 	if err != nil {
 		return err
@@ -164,36 +234,31 @@ func recover(evidencePath string, shardPaths []string, outDir string) error {
 	if err != nil {
 		return fmt.Errorf("evidence timeline: %w", err)
 	}
-	shards := make([]*to.Shard, 0, len(shardPaths))
-	for _, p := range shardPaths {
-		b, err := os.ReadFile(p)
+	signers := make([]*to.FrostSigner, 0, len(sharePaths))
+	for _, p := range sharePaths {
+		s, err := loadShare(p)
 		if err != nil {
 			return err
 		}
-		var s to.Shard
-		if err := json.Unmarshal(b, &s); err != nil {
-			return fmt.Errorf("shard %s: %w", p, err)
-		}
-		shards = append(shards, &s)
+		signers = append(signers, s)
 	}
-	// RECONSTRUCT path: >=3 council members (P2), one shard each.
-	members := make([]*to.CouncilMember, 0, len(shards))
-	for i, s := range shards {
-		_, k, _ := ed25519.GenerateKey(rand.Reader)
-		members = append(members, &to.CouncilMember{ID: fmt.Sprintf("C%d", i+1), Key: k, Shard: s})
+	// THRESHOLD path: >=3 members (P2), one share each. The root never
+	// exists: the recovery fork is signed by the council group key.
+	members := make([]*to.CouncilMember, 0, len(signers))
+	for _, s := range signers {
+		members = append(members, &to.CouncilMember{ID: s.ID, Share: s})
 	}
 	evidence := &to.TrustEvent{Type: to.EvDetected, Payload: mustJSON(map[string]int{"bad_index": ev.BadIndex}), Timestamp: 0}
 	rep, err := to.NewCouncil(members).Recover(tl, evidence, 3)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("RECOVER: %d/%d members voted (shards: %d)\n", len(members), 5, len(shards))
-	fmt.Printf("RECONSTRUCT: %d shards -> root key, zeroized after use\n", len(shards))
+	fmt.Printf("RECOVER: %d/%d members signed the handoff\n", len(members), 5)
 	fmt.Printf("RE-ISSUE: %d certs re-issued\n", len(rep.Issued))
 	for _, id := range rep.Issued {
 		fmt.Printf("  issued %s\n", id)
 	}
-	fmt.Printf("COMMIT epoch %d -> canonical, root=%x\n", rep.Commit.Epoch, rep.Timeline.Head())
+	fmt.Printf("COMMIT epoch %d -> canonical, head=%x\n", rep.Commit.Epoch, rep.Timeline.Head())
 	for name, ok := range rep.Verify.Checks {
 		verdict := "PASS"
 		if !ok {
@@ -208,10 +273,14 @@ func recover(evidencePath string, shardPaths []string, outDir string) error {
 		if err := os.MkdirAll(outDir, 0o755); err != nil {
 			return err
 		}
-		if err := rep.Timeline.Save(outDir+"/canonical.json", false); err != nil {
+		if err := rep.Timeline.Save(outDir+"/fork.json", false); err != nil {
 			return err
 		}
-		fmt.Printf("canonical fork written to %s/canonical.json\n", outDir)
+		cb, _ := json.MarshalIndent(rep.Commit, "", "  ")
+		if err := os.WriteFile(outDir+"/commit.json", cb, 0o600); err != nil {
+			return err
+		}
+		fmt.Printf("fork + handoff written to %s/{fork.json,commit.json} (POST to the gateway recover endpoint)\n", outDir)
 	}
 	return nil
 }

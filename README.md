@@ -7,8 +7,8 @@ tests, a formal model, and a benchmark.
 
 This repository is the **engine**, not the airframe: threshold crypto, the
 chain-of-custody timeline, the watchdog ensemble, quorum detection, rollback
-math, and the CLIs that run them are real (Ed25519, SHA-256, Shamir secret
-sharing, TLS 1.3 — stdlib only, zero third-party dependencies). The
+math, and the CLIs that run them are real (Ed25519, SHA-256, FROST threshold
+signatures, TLS 1.3 — stdlib only, zero third-party dependencies). The
 "deployment layer" — a five-machine network, real VPN/DNS/eBPF filters,
 hardware enclave — is documented in `docs/09-limitations.md`, not faked here.
 
@@ -22,9 +22,10 @@ single machine deciding anything alone.
 - **Detect:** 5 independent watchdogs score every 30s cycle; DETECTED iff
   ≥3/5 fall below the calibrated threshold (P2: one compromised watchdog can
   neither trigger nor block).
-- **Recover:** a 5-node council holding Shamir shards of a backup root key —
-  ≥3 votes reconstruct the key, roll back to the last verified checkpoint,
-  and re-issue only the damaged identities (minimal blast radius, P5).
+- **Recover:** a 5-node council of FROST threshold signatures — ≥3 members
+  threshold-sign the epoch handoff (the root key never exists), roll back to
+  the last verified checkpoint, and re-issue only the damaged identities
+  (minimal blast radius, P5).
 - **Prove:** the timeline is an append-only signed hash chain; every rollback
   is a verified fork; recovery post-conditions are checked (P3: a revoked cert
   is never resurrected).
@@ -42,7 +43,7 @@ single machine deciding anything alone.
 
 - `*.go` — core library: `timeline.go`/`graph.go` (trust chain), `watchdogs.go`
   /`detect.go`/`ensemble.go` (ensemble), `audit.go` (transparency), `council.go`
-  /`shamir.go`/`councilnet.go` (threshold + networked recovery), `rollback.go`
+  /`frost.go`/`councilnet.go` (threshold + networked recovery), `rollback.go`
   /`consumer.go` (time travel), `fleet.go`/`transport.go`/`mtls.go` (the mTLS
   wire), `identity.go` (real X.509 + CRL), `bench.go` (TrustOps)
 - `cmd/to/` — one CLI, three personalities (to-tool / to-bench / to-watchdog by
@@ -59,6 +60,10 @@ single machine deciding anything alone.
   (overview, architecture, requirements trace, component map, threat model,
   cryptography, workflow, testing, deployment, honest limitations)
 - `deploy/` — systemd units, `fleet-smoke.sh` live-fleet proof, `kubernetes.yaml`
+- `helm/trust-orchestrator/` — Helm chart (orchestrator, council, watchdogs,
+  gateway, secrets, network policies) for `deploy/kubernetes.yaml` workloads
+- `terraform/` — AWS (EKS), Azure (AKS), GCP (GKE) modules: cluster + node
+  pool + chart install in one apply
 - `tools/` — tla2tools.jar pinned for the model check
 - `reports/` — regenerable evidence: benchmark, calibration, params, TLC log,
   kill-test log, canonical/evidence dumps
@@ -81,13 +86,32 @@ make kill-tests            # K1–K6 fault injection (chaos) suite → reports/k
 make fleet-smoke           # live fleet: 4 processes, real mTLS, healthy + DETECTED verdicts
 make build                 # 10 binaries; make build-linux → static linux/amd64 ELFs
 make docker-build          # container image (Dockerfile) for deploy/kubernetes.yaml
+make helm-lint             # validate helm/trust-orchestrator (requires helm)
+make terraform-validate    # validate terraform/{aws,azure,gcp} (requires terraform)
 ```
+
+## Kubernetes / cloud deployment
+
+Three equivalent paths (the Docker image + bootstrap ceremony are the same):
+
+- **Raw manifests:** apply `deploy/kubernetes.yaml` (namespace, secrets,
+  configmaps, deployments, network policies) with `kubectl`.
+- **Helm:** `helm install trust-orchestrator helm/trust-orchestrator --values values-prod.yaml`
+  (chart = the same workloads, templated; bootstrap material from the offline
+  ceremony goes into `values.secrets.*` / `council.members`).
+- **Terraform (AWS/Azure/GCP):** each dir in `terraform/` provisions the
+  managed cluster (EKS/AKS/GKE) and Helm-installs the chart — see
+  `terraform/README.md`.
+
+CI runs on both GitHub Actions (`.github/workflows/ci.yml`) and GitLab
+(`.gitlab-ci.yml`) with the same gates: vet, tests, kill suite, fuzz smoke,
+benchmark + calibration-drift check, and a reduced TLC model check.
 
 Bootstrap + enrollment ceremony (one-time, offline / per node):
 
 ```bash
 go run ./cmd/to genkey bootstrap.key
-go run ./cmd/to shard --key bootstrap.key --shares 5 --threshold 3   # 5 shard files
+go run ./cmd/to shard --key bootstrap.key --shares 5 --threshold 3   # 5 FROST share files
 go run ./cmd/to enroll --bootstrap bootstrap.key --config config.yaml
 go run ./cmd/to enroll --bootstrap bootstrap.key --node-id W1        # short form
 go run ./cmd/to revoke --bootstrap bootstrap.key                    # FR8.2: spent after genesis
@@ -116,9 +140,13 @@ Manual recovery drill (after an attack):
 
 ```sh
 go run ./cmd/council recover --evidence reports/evidence.json \
-    --shards shard-1.json shard-2.json shard-3.json --out reports
-# -> RECOVER/RECONSTRUCT/RE-ISSUE/COMMIT/VERIFY report; canonical.json
+    --shares share-M1.json share-M2.json share-M3.json --out reports
+# -> RECOVER/RE-ISSUE/COMMIT/VERIFY report; fork.json + commit.json
 ```
+
+Then POST the artifact to the gateway (below). The FROST shares come from
+`to-council dkg --members 5 --threshold 3 --out <dir>` (the root key never
+exists on this path).
 
 Daily operation:
 
@@ -182,8 +210,11 @@ cd specs && java -jar ../tools/tla2tools.jar -workers 12 \
 One binary, REST + RBAC + multi-tenant orgs + webhooks + backup/restore:
 
 ```sh
-go run ./cmd/gateway -addr :8080 -data ./data   # first boot prints the admin token
-TOKEN=<printed-token>                            # Authorization: Bearer <token>
+go run ./cmd/gateway -addr :8080 -data ./data          # first boot prints the admin token
+go run ./cmd/gateway -addr :8443 -tls-cert c.pem -tls-key k.pem   # HTTPS termination
+go run ./cmd/gateway -council-pub <hex>                # recovery trust anchor (or TO_COUNCIL_PUB)
+go run ./cmd/gateway -leader-lock ./data/lock          # HA single-writer; second instance exits
+TOKEN=<printed-token>                                  # Authorization: Bearer <token>
 
 curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8080/v1/orgs \
      -d '{"name":"acme"}'                        # tenant -> {"id":"acme",...}
@@ -196,14 +227,23 @@ curl -H "Authorization: Bearer $TOKEN" localhost:8080/v1/audit?identity=user
 curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8080/v1/backup   # snapshot
 curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8080/v1/restore --data-binary @bundle.json
 curl -H "Authorization: Bearer $TOKEN" localhost:8080/v1/metrics           # prometheus text
+# tokens can be org-scoped, and mutating calls can be idempotent:
+curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8080/v1/users/admin/tokens \
+     -d '{"orgs":["acme"]}'                          # token limited to acme only
+curl -H "Authorization: Bearer $TOKEN" -H "Idempotency-Key: issue-c1" -X POST \
+     localhost:8080/v1/orgs/acme/issue -d '{"cert_id":"c1","identity":"user"}'  # replay-safe
 ```
 
 Detection + recovery over the API: post watchdog scores to
 `/v1/orgs/{org}/scores` (≥3/5 below threshold → DETECTED event + webhooks),
-then `/v1/orgs/{org}/recover` with 3 of the 5 ceremony shards
-(`GET /v1/orgs/{org}/keys` → `to shard`). Roles: admin / operator / auditor /
-viewer; orgs field on a user scopes them to specific tenants. Full route
-table in `api.go`; end-to-end checks in `api_test.go`.
+then `POST /v1/orgs/{org}/recover` with the council's `{timeline, commit}`
+artifact (from `to-council recover`). The gateway verifies the FROST
+threshold signature against its configured council trust anchor
+(`--council-pub`), the fork's chain integrity, and that it descends from
+the org's verified prefix before adopting it — no shards or seeds ever
+cross this surface. Roles: admin / operator / auditor / viewer; orgs field
+on a user scopes them to specific tenants. Full route table in `api.go`;
+end-to-end checks in `api_test.go`.
 
 Dashboard: open `http://localhost:8080/`, paste the token, manage orgs,
 issue/revoke/recover, audit search, webhooks, users, metrics, backup/restore —

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: trust-orchestrator
+description: PKI trust-management engine — watchdog ensemble detection, council recovery, rollback. Mirrors deploy/kubernetes.yaml as a chart.
+type: application
+version: 0.1.0
+appVersion: "1.0"

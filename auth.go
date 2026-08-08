@@ -45,6 +45,10 @@ type User struct {
 	Role   string   `json:"role"`
 	Orgs   []string `json:"orgs,omitempty"`
 	Tokens []string `json:"tokens"` // SHA-256(token) hashes, never raw
+	// TokenOrgs further scopes individual tokens: token -> orgs. Absent
+	// key = token inherits the user's scope. An org checked here must also
+	// pass u.inOrg (both gates apply).
+	TokenOrgs map[string][]string `json:"token_orgs,omitempty"`
 }
 
 func (u *User) inOrg(org string) bool {
@@ -59,16 +63,37 @@ func (u *User) inOrg(org string) bool {
 	return false
 }
 
+// tokenInOrg applies per-token org scoping (empty scopes = user scope).
+func (u *User) tokenInOrg(tokenHashStr, org string) bool {
+	scopes, ok := u.TokenOrgs[tokenHashStr]
+	if !ok {
+		return true
+	}
+	for _, o := range scopes {
+		if o == org {
+			return true
+		}
+	}
+	return false
+}
+
 // NewToken generates one raw API token and registers its hash. Returns the
 // raw token exactly once — the caller shows it to the operator, then it is
-// unrecoverable.
-func (u *User) NewToken() (string, error) {
+// unrecoverable. Orgs (optional) restricts this token to those orgs only.
+func (u *User) NewToken(orgs ...string) (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
 	raw := hex.EncodeToString(b)
-	u.Tokens = append(u.Tokens, tokenHash(raw))
+	h := tokenHash(raw)
+	u.Tokens = append(u.Tokens, h)
+	if len(orgs) > 0 {
+		if u.TokenOrgs == nil {
+			u.TokenOrgs = map[string][]string{}
+		}
+		u.TokenOrgs[h] = orgs
+	}
 	return raw, nil
 }
 

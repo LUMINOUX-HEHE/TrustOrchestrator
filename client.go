@@ -158,9 +158,10 @@ func (c *Client) Scores(org, nodeID string, score float64, badIndex int) error {
 		"node_id": nodeID, "score": score, "p_value": 0.01, "evidence": ev}, nil)
 }
 
-// Recover runs council recovery with >= 3 ceremony shards (see ShamirSplit).
-func (c *Client) Recover(org string, shards []*Shard) error {
-	return c.json("POST", "/v1/orgs/"+org+"/recover", map[string]any{"shards": shards}, nil)
+// Recover submits a council recovery artifact ({timeline, commit} from
+// `to-council recover`) to /v1/orgs/{org}/recover.
+func (c *Client) Recover(org string, timeline json.RawMessage, commit *FrostCommit) error {
+	return c.json("POST", "/v1/orgs/"+org+"/recover", map[string]any{"timeline": timeline, "commit": commit}, nil)
 }
 
 // Audit searches timeline events across visible orgs.

@@ -10,7 +10,7 @@ What ships, what runs where, and what's the deployment layer's real status.
 | `to-bench` | benchmark runner (argv0 alias of `to-tool`) | `run --scenario all`, `calibrate` |
 | `to-watchdog` | per-node watchdog (argv0 alias) | `enroll`, `run --events --kind --params --tail` |
 | `to-orchestrator` | status, timeline, graph, policy, rollback | `status`, `timeline`, `verify --root`, `policy reload`, `rollback --dry-run` |
-| `to-council` | recovery council: 5 member nodes + ceremony machine | `serve` (networked member, mTLS), `recover` (shard files) |
+| `to-council` | recovery council: 5 member nodes + ceremony machine | `serve` (networked member, mTLS), `recover` (FROST share files) |
 | `to-auditor` | mirror log checker | `audit --log` |
 | `to-identity` | certificate authority | `ca`, `issue`, `verify` |
 | `to-pdp` | policy decision point | `check --policy --events` |
@@ -21,7 +21,9 @@ exit 0.
 ## Bootstrap ceremony (guide §5, air-gapped)
 
 1. Offline: `to-tool genkey <root>`
-2. `to-tool shard --key <root> --shares 5 --threshold 3` → 5 pieces
+2. `to-tool shard --key <root> --shares 5 --threshold 3` → 5 FROST share files
+   (`to-cconcouncil dkg` covers a key-free ceremony; the printed GROUP KEY is
+   the gateway's council anchor)
 3. `to-tool enroll` / `to-watchdog enroll` each node
 4. `to-tool revoke --bootstrap <root>` — spent, genesis is over (FR8.2)
 
@@ -126,7 +128,7 @@ What runs where (namespace `trust-orchestrator`):
 | Component | Workload | Entrypoint |
 |---|---|---|
 | orchestrator (fleet server, PVC for evidence) | Deployment ×1 | `to-orchestrator serve --listen 0.0.0.0:8333` |
-| council members C1–C5 (one shard each) | Deployment ×5 | `to-council serve --id C<N> --addr 0.0.0.0:8443` |
+| council members C1–C5 (one FROST share each) | Deployment ×5 | `to-council serve --id C<N> --addr 0.0.0.0:8443` |
 | watchdogs (distinct fleet IDs) | StatefulSet ×5 | `to-watchdog run --live orchestrator:8333 --node-id-file /etc/podinfo/name` |
 | identity CA | Secrets only | — |
 
@@ -161,5 +163,5 @@ make model-check-mutations  # P2/P6 mutants must *fail* (artifact = mutation-*.l
 
 ## No secrets in the zip
 
-Keys and lives only offline/generated: `node.key`, `shard-*.json`, the dev
+Keys and lives only offline/generated: `node.key`, `share-*.json`, the dev
 `bootstrap.key` are git-ignored (`reports/` and `bin/` are gitignored too).

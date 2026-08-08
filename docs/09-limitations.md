@@ -23,12 +23,13 @@ skipped/partially implemented** — the same table a judge can read in
 
 ## The honest answer to "is anything faked?"
 
-No. Every cryptographic claim is real and tested: Ed25519, SHA-256, Shamir
-3-of-5, TLS 1.3 mutual auth, X509. What is *simulated* is the **transport
-and deployment layer** — the in-process fleet instead of five VMs, mTLS on
-loopback instead of cross-host, and no hardware enclave. Those are the exact
-boundaries a local project can't honestly cross, and they are all explicitly
-flagged in `trust-orchestrator-final-report.md §10` and this chapter.
+No. Every cryptographic claim is real and tested: Ed25519, SHA-256, FROST
+3-of-5 threshold signatures, TLS 1.3 mutual auth, X509. What is *simulated*
+is the **transport and deployment layer** — the in-process fleet instead of
+five VMs, mTLS on loopback instead of cross-host, and no hardware enclave.
+Those are the exact boundaries a local project can't honestly cross, and
+they are all explicitly flagged in `trust-orchestrator-final-report.md §10`
+and this chapter.
 
 ## If you want to push reality one step further
 

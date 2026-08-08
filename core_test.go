@@ -58,52 +58,62 @@ func TestShamirTooFewShards(t *testing.T) {
 	}
 }
 
-func TestEpochCommitValidity(t *testing.T) {
-	shards, _ := ShamirSplit(make([]byte, 32), 5, 3)
-	members := make([]*CouncilMember, 5)
-	for i := range members {
-		_, k, _ := ed25519.GenerateKey(rand.Reader)
-		members[i] = &CouncilMember{ID: fmt.Sprintf("C%d", i+1), Key: k, Shard: shards[i]}
+func frostCouncil(t *testing.T, n, min int) *Council {
+	t.Helper()
+	signers, _, err := DkgCeremony(n, min)
+	if err != nil {
+		t.Fatal(err)
 	}
-	c := NewCouncil(members)
-	ec, ok := c.SignCommit(1, []byte("root"), 0, nil, 3, "C1", "C2", "C3")
-	if !ok || !ec.Valid(c.Pubs(), 3) {
+	members := make([]*CouncilMember, n)
+	for i, sg := range signers {
+		members[i] = &CouncilMember{ID: sg.ID, Share: sg}
+	}
+	return NewCouncil(members)
+}
+
+func TestEpochCommitValidity(t *testing.T) {
+	c := frostCouncil(t, 5, 3)
+	group := c.GroupPub()
+	ids := c.memberIDs()
+	fc, ok := c.SignCommit(1, []byte("root"), 0, bytes.Repeat([]byte{0xaa}, 32), []byte("payload"), 3, ids[:3]...)
+	if !ok || !fc.Valid(group, 3) {
 		t.Fatal("valid commit rejected")
 	}
-	if ec.Valid(c.Pubs(), 4) {
+	if fc.Valid(group, 4) {
 		t.Fatal("3 signatures must not satisfy quorum 4")
 	}
-	if _, ok := c.SignCommit(3, []byte("root"), 1, nil, 3, "C1", "C2", "C3"); ok {
+	c2 := frostCouncil(t, 5, 3)
+	if _, ok := c2.SignCommit(3, []byte("root"), 1, bytes.Repeat([]byte{0xaa}, 32), []byte("payload"), 3, c2.memberIDs()...); ok {
 		t.Fatal("non-contiguous epoch (jump 1->3) accepted")
 	}
-	if ec.Valid(map[string]ed25519.PublicKey{}, 3) {
-		t.Fatal("commit valid against an empty pubkey set")
+	if fc.Valid(ed25519.PublicKey(make([]byte, 32)), 3) {
+		t.Fatal("commit valid against a foreign group key")
 	}
 }
 
 // TestDoubleVoteRejected (test plan §4, "Vote protocol"): a member voting
 // twice (duplicate id) counts once; quorum needs distinct members.
 func TestDoubleVoteRejected(t *testing.T) {
-	shards, _ := ShamirSplit(make([]byte, 32), 5, 3)
-	members := make([]*CouncilMember, 5)
-	for i := range members {
-		_, k, _ := ed25519.GenerateKey(rand.Reader)
-		members[i] = &CouncilMember{ID: fmt.Sprintf("C%d", i+1), Key: k, Shard: shards[i]}
-	}
-	c := NewCouncil(members)
+	c := frostCouncil(t, 5, 3)
+	ids := c.memberIDs()
+	newPub := bytes.Repeat([]byte{0xaa}, 32)
 	// C1 listed three times + C2 + C3: only 3 distinct members sign.
-	ec, ok := c.SignCommit(1, []byte("root"), 0, nil, 3, "C1", "C1", "C1", "C2", "C3")
+	fc, ok := c.SignCommit(1, []byte("root"), 0, newPub, []byte("payload"), 3, ids[0], ids[0], ids[0], ids[1], ids[2])
 	if !ok {
 		t.Fatal("commit with 3 distinct members rejected")
 	}
-	if len(ec.Sigs) != 3 {
-		t.Fatalf("duplicate votes must dedupe to 3 signatures, got %d", len(ec.Sigs))
+	if len(fc.Members) != 3 {
+		t.Fatalf("duplicate votes must dedupe to 3 members, got %d", len(fc.Members))
 	}
-	if ec.Valid(c.Pubs(), 4) {
+	if !fc.Valid(c.GroupPub(), 3) {
+		t.Fatal("deduped 3-member commit must verify")
+	}
+	if fc.Valid(c.GroupPub(), 4) {
 		t.Fatal("3 distinct signatures must not satisfy quorum 4, even with duplicates listed")
 	}
 	// Two members, listed repeatedly, can never reach quorum 3.
-	if _, ok := c.SignCommit(2, []byte("root"), 1, nil, 3, "C1", "C1", "C1", "C2", "C2"); ok {
+	c2 := frostCouncil(t, 5, 3)
+	if _, ok := c2.SignCommit(2, []byte("root"), 1, newPub, []byte("payload"), 3, c2.memberIDs()[0], c2.memberIDs()[0], c2.memberIDs()[0], c2.memberIDs()[1], c2.memberIDs()[1]); ok {
 		t.Fatal("double-voting must not inflate the quorum count")
 	}
 }
@@ -341,27 +351,18 @@ func TestEndToEndPostRecovery(t *testing.T) {
 	if !Detect(scores, threshold, quorum) {
 		t.Fatal("end-to-end: ensemble must detect the burst")
 	}
-	// Council recovery.
-	shards, _ := ShamirSplit(key.Seed(), 5, 3)
-	members := make([]*CouncilMember, 5)
-	for i := range members {
-		_, k, _ := ed25519.GenerateKey(rand.Reader)
-		members[i] = &CouncilMember{ID: fmt.Sprintf("C%d", i+1), Key: k, Shard: shards[i]}
-	}
+	// Council recovery: threshold-signed handoff; the root never exists.
+	c := frostCouncil(t, 5, quorum)
 	evPl, _ := json.Marshal(map[string]int{"bad_index": attackIdx})
 	tl.Append(EvDetected, evPl, 100)
 	evidence := &tl.events[len(tl.events)-1]
-	rep, err := NewCouncil(members).Recover(tl, evidence, quorum)
+	rep, err := c.Recover(tl, evidence, quorum)
 	if err != nil || !rep.Verify.Pass() {
 		t.Fatalf("end-to-end: recovery failed: %v", err)
 	}
-	// Consumer: the reconstructed root signs a fresh CA; a workload cert
-	// issued under it verifies end to end.
-	root, err := ShamirJoin(shards[:3])
-	if err != nil {
-		t.Fatal(err)
-	}
-	caKey := ed25519.NewKeyFromSeed(root)
+	// Consumer: the new epoch root (coordinator-side only) signs a fresh
+	// CA; a workload cert issued under it verifies end to end.
+	caKey := ed25519.NewKeyFromSeed(rep.RootSeed)
 	ca, caDER, err := NewIdentityCA(caKey, "post-recovery CA", time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
 	if err != nil {
 		t.Fatal(err)

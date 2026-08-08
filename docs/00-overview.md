@@ -23,8 +23,8 @@ This system is the decision + recovery _engine_ for exactly that problem.
    (W1..W5)                          │           │
                                      │   DETECTED │  ≥3/5 quorum
                                      v           v
-                               Council (Shamir)   Rollback + re-issue
-                               3-of-5 vote        (minimal blast radius)
+                               Council (FROST)    Rollback + re-issue
+                               3-of-5 signature   (minimal blast radius)
 ```
 
 ## What it guarantees (the proof obligations)

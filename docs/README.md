@@ -18,6 +18,7 @@ and was verified live on 2026-08-02 (**45/45 tests pass, exit 0**).
 | [08-deployment.md](08-deployment.md) | Binaries, commands, config, deployment layer status |
 | [09-limitations.md](09-limitations.md) | Honest list of what is and is not yet real |
 | [10-gateway.md](10-gateway.md) | REST API, dashboard, RBAC, multi-tenancy, webhooks, backup |
+| [11-demo.md](11-demo.md) | Teacher/pitch demo: one-command live walkthrough |
 
 ## Fifty-second summary
 
@@ -28,7 +29,7 @@ A judge-friendly one-paragraph version:
 > recovery of a compromised network requires agreement by at least 3 of 5
 > sensors and a 3-of-5 council vote; the network is then rolled back to a
 > known-good point and only damaged certificates are re-issued. The math is
-> real (Ed25519, SHA-256, Shamir secret-sharing, TLS 1.3), and every claim is
+> real (Ed25519, SHA-256, FROST threshold signatures, TLS 1.3), and every claim is
 > backed by an automated test. The remaining gaps are the "deployment layer" —
 > running the same logic across real machines, real VPN/DNS filters, and a
 > hardware enclave — which needs hardware that a laptop cannot fake.

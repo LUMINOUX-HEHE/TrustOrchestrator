@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  namespace: {{ .Values.namespace.name }}
+  labels: {{- include "to.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.orchestrator.replicas }}
+  selector:
+    matchLabels: {app: orchestrator}
+  template:
+    metadata:
+      labels: {app: orchestrator}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 65534}
+      volumes:
+        - name: ca
+          secret: {secretName: identity-ca}
+        - name: node-tls
+          secret: {secretName: orchestrator-node}
+        - name: data
+          persistentVolumeClaim: {claimName: orchestrator-data}
+      containers:
+        - name: orchestrator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/to-orchestrator", "serve"]
+          args:
+            - --listen=0.0.0.0:8333
+            - --ca=/ca/ca.der
+            - --cert=/tls/leaf.der
+            - --key=/tls/node.key
+          ports: [{containerPort: 8333}]
+          volumeMounts:
+            - {name: ca, mountPath: /ca, readOnly: true}
+            - {name: node-tls, mountPath: /tls, readOnly: true}
+            - {name: data, mountPath: /data}
+          readinessProbe: {tcpSocket: {port: 8333}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator
+  namespace: {{ .Values.namespace.name }}
+spec:
+  selector: {app: orchestrator}
+  ports: [{port: 8333, targetPort: 8333}]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: orchestrator-data
+  namespace: {{ .Values.namespace.name }}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: {{ .Values.orchestrator.storage }}}}

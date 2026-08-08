@@ -8,13 +8,22 @@ package trustorchestrator
 // move to SQLite when a single org's audit search outgrows a load.
 
 import (
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 )
+
+// encMagic prefixes sealed on-disk blobs; legacy plaintext files lack it.
+const encMagic = "TOENC1"
 
 const auditCap = 5000
 
@@ -51,32 +60,73 @@ type Webhook struct {
 	Active bool     `json:"active"`
 }
 
-// Store is the whole gateway state, persisted under one directory.
+// Store is the whole gateway state, persisted under one directory. The
+// seal key (tenant file encryption) lives in gateway.key, NOT in this
+// struct, so it never rides along in gateway.json copies/backups.
 type Store struct {
-	mu       sync.Mutex
-	dir      string
-	Users    map[string]*User   `json:"users"`
-	Webhooks []*Webhook         `json:"webhooks"`
-	Tenants  map[string]*Tenant `json:"tenants"`
-	audit    []AuditEntry
-	started  time.Time
+	mu         sync.Mutex
+	dir        string
+	sealKey    []byte             // 32-byte AES key; zero when disabled (legacy dirs)
+	Users      map[string]*User   `json:"users"`
+	Webhooks   []*Webhook         `json:"webhooks"`
+	Tenants    map[string]*Tenant `json:"tenants"`
+	CouncilPub []byte             `json:"council_pub,omitempty"` // FROST group key; trust anchor for recoveries
+	audit      []AuditEntry
+	started    time.Time
+	outbox     []webhookJob // durable delivery queue (webhooks.go); own file, not gateway.json
+	outboxOnce sync.Once
+	idem       map[string]idemEntry // Idempotency-Key replay cache (api.go), in-memory
 }
 
-// NewStore loads or initializes the store under dir.
+// SetCouncilPub installs the council FROST group key (trust anchor) and
+// persists it. Test/operator wiring: cmd/gateway or integration tests.
+func (s *Store) SetCouncilPub(pub ed25519.PublicKey) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.CouncilPub = append([]byte(nil), pub...)
+	return s.saveMeta()
+}
+
+// CouncilPublicKey returns the configured trust anchor, or nil.
+func (s *Store) CouncilPublicKey() ed25519.PublicKey {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]byte(nil), s.CouncilPub...)
+}
+
+// NewStore loads or initializes the store under dir. The seal key is
+// created once (gateway.key); a data-dir without one runs unencrypted
+// (legacy), which loadTenantTimeline tolerates.
 func NewStore(dir string) (*Store, error) {
-	s := &Store{dir: dir, Users: map[string]*User{}, Tenants: map[string]*Tenant{}, started: time.Now()}
+	s := &Store{dir: dir, Users: map[string]*User{}, Tenants: map[string]*Tenant{}, started: time.Now(), idem: map[string]idemEntry{}}
 	if err := os.MkdirAll(filepath.Join(dir, "tenants"), 0o700); err != nil {
 		return nil, err
+	}
+	s.sealKey, _ = os.ReadFile(filepath.Join(dir, "gateway.key"))
+	if len(s.sealKey) != 32 {
+		s.sealKey = make([]byte, 32)
+		if _, err := rand.Read(s.sealKey); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(filepath.Join(dir, "gateway.key"), s.sealKey, 0o600); err != nil {
+			return nil, err
+		}
+		// legacy files written without a key stay plaintext on disk;
+		// every write from here on is sealed
 	}
 	b, err := os.ReadFile(filepath.Join(dir, "gateway.json"))
 	if err == nil {
 		if err := json.Unmarshal(b, s); err != nil {
 			return nil, fmt.Errorf("store: corrupt gateway.json: %w", err)
 		}
+		s.loadOutbox()
 		for id := range s.Tenants {
-			tl, err := LoadTimeline(filepath.Join(dir, "tenants", id, "timeline.json"))
+			tl, err := s.loadTenantTimeline(id)
 			if err != nil {
 				return nil, fmt.Errorf("store: tenant %s: %w", id, err)
+			}
+			if len(s.CouncilPub) == ed25519.PublicKeySize && len(tl.CouncilPub()) == 0 {
+				tl.SetCouncilPub(s.CouncilPub) // re-stamp after a reload
 			}
 			s.Tenants[id].tl = tl
 			s.Tenants[id].fleet = NewFleet(threshold, quorum, 0)
@@ -86,6 +136,22 @@ func NewStore(dir string) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// loadTenantTimeline reads one tenant's timeline file, sealed or legacy.
+func (s *Store) loadTenantTimeline(id string) (*Timeline, error) {
+	b, err := os.ReadFile(filepath.Join(s.dir, "tenants", id, "timeline.json"))
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.HasPrefix(b, []byte(encMagic)) {
+		return UnmarshalTimeline(b) // legacy plaintext
+	}
+	raw, err := openSealed(s.sealKey, b)
+	if err != nil {
+		return nil, err
+	}
+	return UnmarshalTimeline(raw)
 }
 
 // CreateTenant makes a fresh org with its own timeline and detector.
@@ -102,6 +168,9 @@ func (s *Store) CreateTenant(id, name string) (*Tenant, string, error) {
 	t := &Tenant{ID: id, Name: name, Created: time.Now().Unix(),
 		KeyHash: sha256Hex(key.Seed()), tl: NewTimeline(key),
 		fleet: NewFleet(threshold, quorum, 0), counters: map[string]int64{}}
+	if len(s.CouncilPub) == ed25519.PublicKeySize {
+		t.tl.SetCouncilPub(s.CouncilPub) // org chains live under the council anchor
+	}
 	s.Tenants[id] = t
 	if err := s.saveTenant(t); err != nil {
 		return nil, "", err
@@ -109,7 +178,7 @@ func (s *Store) CreateTenant(id, name string) (*Tenant, string, error) {
 	if err := s.saveMeta(); err != nil {
 		return nil, "", err
 	}
-	return t, fmt.Sprintf("tenant %q created; shards via GET /v1/orgs/%s/keys (offline ceremony)", id, id), nil
+	return t, fmt.Sprintf("tenant %q created (root key local to gateway; recovery is council-authorized)", id), nil
 }
 
 // DeleteTenant removes an org from the active set; its files are moved aside,
@@ -144,11 +213,52 @@ func (s *Store) saveTenant(t *Tenant) error {
 	if err != nil {
 		return err
 	}
+	if len(s.sealKey) == 32 {
+		if b, err = seal(s.sealKey, b); err != nil {
+			return err
+		}
+	}
 	dir := filepath.Join(s.dir, "tenants", t.ID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	return writeFileAtomic(filepath.Join(dir, "timeline.json"), b)
+}
+
+// seal adds a magic prefix, random nonce, then AES-256-GCM (the iv rides
+// along). openSealed reverses it. Non-encrypting callers (Restore against a
+// keyless store) need Key; a keyed store re-encrypts via saveTenant.
+func seal(key, plain []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, 12)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	out := append([]byte(encMagic), nonce...)
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	return aead.Seal(out, nonce, plain, nil), nil
+}
+
+func openSealed(key, blob []byte) ([]byte, error) {
+	if len(key) != 32 {
+		return nil, errors.New("store: timeline is sealed but no seal key (gateway.key)")
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce, ct := blob[len(encMagic):len(encMagic)+12], blob[len(encMagic)+12:]
+	return aead.Open(nil, nonce, ct, nil)
 }
 
 func writeFileAtomic(path string, b []byte) error {
@@ -210,6 +320,8 @@ func (s *Store) Backup() ([]byte, error) {
 		tls[id] = b
 	}
 	bundle["tenants"] = tls
+	// ponytail: the bundle is an operator export, same trust tier as
+	// evidence dumps (keys included) — at-rest files are the seal target.
 	return json.MarshalIndent(bundle, "", "  ")
 }
 
@@ -230,6 +342,7 @@ func (s *Store) Restore(b []byte) error {
 	}
 	gw := bundle.Gateway
 	gw.dir = s.dir
+	gw.sealKey = append([]byte(nil), s.sealKey...) // re-encrypt under our key
 	gw.started = time.Now()
 	nt := map[string]*Tenant{}
 	for id, raw := range bundle.Tenants {

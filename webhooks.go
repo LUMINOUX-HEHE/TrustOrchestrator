@@ -3,9 +3,10 @@ package trustorchestrator
 // webhooks: outbound notifications on trust events. On every trigger the
 // dispatcher POSTs {org, type, ts, event_hash, details} JSON to each
 // matching endpoint, signed with HMAC-SHA256 over the body
-// (X-TO-Signature header), 3 attempts with a fixed backoff.
-// ponytail: in-memory queue — a crash between trigger and delivery drops
-// the notification. Add a durable outbox when delivery guarantees matter.
+// (X-TO-Signature header). Deliveries go through a durable outbox
+// (outbox.json in the data dir): a crash between trigger and delivery
+// replays the pending jobs on restart. Backoff 5s→15s→1m→5m, dropped
+// after 5 attempts (the event itself stays in the org timeline).
 
 import (
 	"bytes"
@@ -13,8 +14,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -24,6 +29,11 @@ const (
 	HookRecovery = "recovery"
 	HookRevoke   = "revoke"
 	HookIssue    = "issue"
+)
+
+const (
+	outboxMaxAttempts = 5
+	outboxPath        = "outbox.json"
 )
 
 func (s *Store) hookMatches(h *Webhook, typ string) bool {
@@ -38,8 +48,19 @@ func (s *Store) hookMatches(h *Webhook, typ string) bool {
 	return len(h.Events) == 0 // empty = all events
 }
 
-// FireWebhooks dispatches one event to every matching endpoint (locking
-// internally — callers must NOT hold s.mu). Goroutines do the network I/O.
+// webhookJob is one pending delivery, persisted between restarts.
+type webhookJob struct {
+	URL      string `json:"url"`
+	Secret   string `json:"secret"`
+	Events   string `json:"events"`
+	Body     string `json:"body"`
+	Attempts int    `json:"attempts"`
+	NextAt   int64  `json:"next_at"`
+}
+
+// FireWebhooks dispatches one event to every matching endpoint. It only
+// queues; the drain loop (StartWebhookOutbox) does the network I/O.
+// Callers must NOT hold s.mu.
 func (s *Store) FireWebhooks(org, typ string, eventHash []byte, details map[string]any) {
 	s.mu.Lock()
 	hooks := make([]*Webhook, 0, len(s.Webhooks))
@@ -56,31 +77,128 @@ func (s *Store) FireWebhooks(org, typ string, eventHash []byte, details map[stri
 	if err != nil {
 		return
 	}
+	s.mu.Lock()
 	for _, h := range hooks {
-		go deliver(h, body)
+		s.outbox = append(s.outbox, webhookJob{
+			URL: h.URL, Secret: h.Secret,
+			Events: strings.Join(h.Events, ","),
+			Body:   string(body), NextAt: time.Now().Unix(),
+		})
+	}
+	s.saveOutboxLocked()
+	s.mu.Unlock()
+}
+
+// StartWebhookOutbox spins up the delivery drain loop (idempotent).
+// Called by cmd/gateway at boot; tests drive FireWebhooks directly through
+// the loop via newTestGateway.
+func (s *Store) StartWebhookOutbox() {
+	s.outboxOnce.Do(func() {
+		go s.outboxLoop()
+	})
+}
+
+func (s *Store) outboxLoop() {
+	// ponytail: eager first pass (fresh trigger after boot delivers fast),
+	// then a 1s ticker; backoff keeps network load low.
+	time.Sleep(100 * time.Millisecond)
+	s.drainOutbox()
+	for range time.Tick(1 * time.Second) {
+		s.drainOutbox()
 	}
 }
 
-func deliver(h *Webhook, body []byte) {
-	for attempt := 1; attempt <= 3; attempt++ {
-		req, err := http.NewRequest(http.MethodPost, h.URL, bytes.NewReader(body))
-		if err != nil {
-			return
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-TO-Signature", hmacHex(h.Secret, body))
-		resp, err := http.DefaultClient.Do(req)
-		if err == nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				return
-			}
-		}
-		if attempt < 3 {
-			time.Sleep(2 * time.Second)
+func (s *Store) drainOutbox() {
+	now := time.Now().Unix()
+	var due []webhookJob
+	s.mu.Lock()
+	kept := s.outbox[:0]
+	for _, j := range s.outbox {
+		if j.NextAt <= now {
+			due = append(due, j)
+		} else {
+			kept = append(kept, j)
 		}
 	}
+	s.outbox = kept
+	s.mu.Unlock()
+	for _, j := range due {
+		s.tryDeliver(j)
+	}
+}
+
+func (s *Store) tryDeliver(j webhookJob) {
+	ok := deliver(j)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.outbox {
+		if s.outbox[i].URL == j.URL && s.outbox[i].Body == j.Body {
+			if ok {
+				s.outbox = append(s.outbox[:i], s.outbox[i+1:]...)
+			} else {
+				s.outbox[i].Attempts++
+				if s.outbox[i].Attempts >= outboxMaxAttempts {
+					s.outbox = append(s.outbox[:i], s.outbox[i+1:]...)
+				} else {
+					s.outbox[i].NextAt = time.Now().Unix() + backoff(s.outbox[i].Attempts)
+				}
+			}
+			break
+		}
+	}
+	s.saveOutboxLocked()
+}
+
+// backoff: 5s, 15s, 1m, 5m (attempts 1..4); callers cap after 5 attempts.
+func backoff(attempt int) int64 {
+	switch attempt {
+	case 1:
+		return 5
+	case 2:
+		return 15
+	case 3:
+		return 60
+	default:
+		return 300
+	}
+}
+
+func (s *Store) loadOutbox() {
+	b, err := os.ReadFile(filepath.Join(s.dir, outboxPath))
+	if err != nil {
+		return // absent = fresh store; corrupt = drop, outbox is at-most-once
+	}
+	if err := json.Unmarshal(b, &s.outbox); err != nil {
+		fmt.Fprintf(os.Stderr, "outbox: ignoring corrupt %s: %v\n", outboxPath, err)
+	}
+}
+
+func (s *Store) saveOutboxLocked() {
+	if s.outbox == nil {
+		return
+	}
+	b, err := json.Marshal(s.outbox)
+	if err != nil {
+		return
+	}
+	// ponytail: direct write, tolerate torn writes — worst case a dup re-fire
+	_ = writeFileAtomic(filepath.Join(s.dir, outboxPath), b)
+}
+
+func deliver(j webhookJob) bool {
+	req, err := http.NewRequest(http.MethodPost, j.URL, bytes.NewBufferString(j.Body))
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-TO-Signature", hmacHex(j.Secret, []byte(j.Body)))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
 }
 
 func hmacHex(secret string, body []byte) string {

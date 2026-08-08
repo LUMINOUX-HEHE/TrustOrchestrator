@@ -40,11 +40,13 @@ func TestK3KillOneCouncilMember(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		tl.Append(EvIssue, issue(fmt.Sprintf("c%d", i), "user", "", int64(i)), int64(i))
 	}
-	shards, _ := ShamirSplit(key.Seed(), 5, 3)
+	signers, _, err := DkgCeremony(5, quorum)
+	if err != nil {
+		t.Fatal(err)
+	}
 	members := make([]*CouncilMember, 4) // C5 killed mid-recovery
 	for i := range members {
-		_, k, _ := ed25519.GenerateKey(rand.Reader)
-		members[i] = &CouncilMember{ID: fmt.Sprintf("C%d", i+1), Key: k, Shard: shards[i]}
+		members[i] = &CouncilMember{ID: signers[i].ID, Share: signers[i]}
 	}
 	ev := detectedEvidenceFor(tl, 8)
 	rep, err := NewCouncil(members).Recover(tl, ev, quorum)
@@ -63,11 +65,13 @@ func TestK4KillThreeCouncilMembers(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		tl.Append(EvIssue, issue(fmt.Sprintf("c%d", i), "user", "", int64(i)), int64(i))
 	}
-	shards, _ := ShamirSplit(key.Seed(), 5, 3)
+	signers, _, err := DkgCeremony(5, quorum)
+	if err != nil {
+		t.Fatal(err)
+	}
 	members := make([]*CouncilMember, 2) // 2 remaining < quorum 3
 	for i := range members {
-		_, k, _ := ed25519.GenerateKey(rand.Reader)
-		members[i] = &CouncilMember{ID: fmt.Sprintf("C%d", i+1), Key: k, Shard: shards[i]}
+		members[i] = &CouncilMember{ID: signers[i].ID, Share: signers[i]}
 	}
 	ev := detectedEvidenceFor(tl, 8)
 	before := len(tl.events)

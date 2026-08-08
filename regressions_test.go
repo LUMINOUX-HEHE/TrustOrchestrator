@@ -51,7 +51,7 @@ func TestWatchdogScoreIdempotent(t *testing.T) {
 }
 
 // Regression: recovery must work when the first council member is down
-// (shard missing) — the shard selection is by available members, not a
+// (share missing) — the quorum selection is by available members, not a
 // hardcoded prefix.
 func TestCouncilRecoversWithoutFirstMember(t *testing.T) {
 	_, key, _ := ed25519.GenerateKey(rand.Reader)
@@ -59,16 +59,18 @@ func TestCouncilRecoversWithoutFirstMember(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		tl.Append(EvIssue, issue(fmt.Sprintf("c%d", i), "user", "", int64(i)), int64(i))
 	}
-	shards, _ := ShamirSplit(key.Seed(), 5, 3)
-	members := []*CouncilMember{{ID: "C1", Shard: nil}} // C1 down mid-recovery
+	signers, _, err := DkgCeremony(5, quorum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	members := []*CouncilMember{{ID: signers[0].ID, Share: nil}} // C1 down mid-recovery
 	for i := 1; i < 5; i++ {
-		_, k, _ := ed25519.GenerateKey(rand.Reader)
-		members = append(members, &CouncilMember{ID: fmt.Sprintf("C%d", i+1), Key: k, Shard: shards[i]})
+		members = append(members, &CouncilMember{ID: signers[i].ID, Share: signers[i]})
 	}
 	ev := detectedEvidenceFor(tl, 8)
 	rep, err := NewCouncil(members).Recover(tl, ev, quorum)
 	if err != nil {
-		t.Fatalf("recovery must succeed without C1's shard: %v", err)
+		t.Fatalf("recovery must succeed without C1's share: %v", err)
 	}
 	if !rep.Verify.Pass() {
 		t.Fatal("post-conditions must hold")

@@ -1,0 +1,16 @@
+Trust Orchestrator installed.
+
+Before recovery will work you must supply the bootstrap material:
+  values.secrets.identityCa, .orchestratorNode, .watchdogNode, .council.members
+
+Get the gateway admin token (first boot):
+  kubectl -n {{ .Values.namespace.name }} logs deploy/gateway | grep "admin token"
+
+Port-forward the management plane:
+  kubectl -n {{ .Values.namespace.name }} port-forward svc/gateway 8080:8080
+  open http://localhost:8080
+
+Recovery drill (networked council, 3 of 5 members):
+  to-council recover --evidence evidence.json --shards shard-1.json shard-2.json shard-3.json
+  # or against the member services:
+  #   to-council serve... (members already run in-cluster at council-c1..c5:8443)

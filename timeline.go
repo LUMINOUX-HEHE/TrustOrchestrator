@@ -21,6 +21,7 @@ const (
 	EvCommit        = "COMMIT"
 	EvShardActivity = "SHARD_ACTIVITY"
 	EvDetected      = "DETECTED"
+	EvKeyRotate     = "KEY_ROTATE"
 )
 
 // TrustEvent is one signed, chained state transition (SRS FR1.1).
@@ -53,11 +54,32 @@ type Timeline struct {
 	mu     sync.Mutex
 	events []TrustEvent
 	key    ed25519.PrivateKey // nil for read-only (loaded) timelines
-	pub    ed25519.PublicKey  // verification key; equals key.Public() when key != nil
+	pub    ed25519.PublicKey  // current verification key (rotates via EvKeyRotate)
+	start  ed25519.PublicKey  // key that signed event[0]; nil = pub (never rotated)
+	// councilPub is the council's FROST group key — the recovery trust
+	// anchor that authorizes EvRecovery key handoffs. nil for timelines
+	// without council-authorized recovery.
+	councilPub ed25519.PublicKey
+	// private keys rotated away (one per recovery), so forks can continue
+	// under the key that was current at their branch point
+	rotations []rotKey
+}
+
+type rotKey struct {
+	at  int // index of the EvKeyRotate event
+	key ed25519.PrivateKey
 }
 
 func NewTimeline(key ed25519.PrivateKey) *Timeline {
-	return &Timeline{key: key, pub: key.Public().(ed25519.PublicKey)}
+	pub := key.Public().(ed25519.PublicKey)
+	return &Timeline{key: key, pub: pub, start: pub}
+}
+
+// Pub returns the current verification key (public).
+func (t *Timeline) Pub() ed25519.PublicKey {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]byte(nil), t.pub...)
 }
 
 // Head returns the hash of the last event, or nil for an empty chain.
@@ -87,6 +109,10 @@ func (t *Timeline) Events() []TrustEvent {
 func (t *Timeline) Append(typ string, payload []byte, ts int64) ([]byte, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.append(typ, payload, ts)
+}
+
+func (t *Timeline) append(typ string, payload []byte, ts int64) ([]byte, error) {
 	if t.key == nil {
 		return nil, fmt.Errorf("timeline: read-only (loaded from file)")
 	}
@@ -94,6 +120,136 @@ func (t *Timeline) Append(typ string, payload []byte, ts int64) ([]byte, error) 
 	e.Signature = ed25519.Sign(t.key, e.canonical())
 	t.events = append(t.events, e)
 	return e.Hash(), nil
+}
+
+// SetCouncilPub binds the council FROST group key to the timeline, the
+// trust anchor that EvRecovery handoffs are verified against.
+func (t *Timeline) SetCouncilPub(pub ed25519.PublicKey) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.councilPub = append([]byte(nil), pub...)
+}
+
+// CouncilPub returns the council trust anchor, or nil if unset.
+func (t *Timeline) CouncilPub() ed25519.PublicKey {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]byte(nil), t.councilPub...)
+}
+
+// FrostCommit is the payload of an EvRecovery event: the council's
+// threshold-signed handoff that switches the chain to a new epoch root key.
+// walkVerify trusts the new key only if the embedded FrostCommit verifies
+// against the timeline's councilPub and binds to this exact chain position.
+type FrostCommit struct {
+	Epoch      int64    `json:"epoch"`
+	Checkpoint []byte   `json:"checkpoint"` // head of the verified prefix (nil for genesis recovery)
+	Prev       int64    `json:"prev"`
+	NewPub     []byte   `json:"new_pub"` // new epoch root verification key (32 bytes)
+	Payload    []byte   `json:"payload"` // e.g. new root CA cert DER
+	Sig        []byte   `json:"sig"`     // aggregated FROST signature over the above
+	Members    []string `json:"members"` // signer ids (audit)
+}
+
+// descriptor is the exact bytes the council threshold-signs.
+func (p *FrostCommit) descriptor() []byte {
+	b, _ := json.Marshal(struct {
+		Epoch      int64  `json:"epoch"`
+		Checkpoint []byte `json:"checkpoint"`
+		Prev       int64  `json:"prev"`
+		NewPub     []byte `json:"new_pub"`
+		Payload    []byte `json:"payload"`
+	}{p.Epoch, p.Checkpoint, p.Prev, p.NewPub, p.Payload})
+	return b
+}
+
+// Valid accepts the handoff iff >= min distinct members signed it: the
+// aggregated FROST signature is a standard Ed25519 signature over the
+// descriptor, so one Verify call against the group key suffices.
+func (p *FrostCommit) Valid(groupPub ed25519.PublicKey, min int) bool {
+	if len(p.Members) < min || len(p.NewPub) != ed25519.PublicKeySize {
+		return false
+	}
+	return ed25519.Verify(groupPub, p.descriptor(), p.Sig)
+}
+
+// keyRotatePayload is the EvKeyRotate event payload: the new verification
+// key, bound into the chain by the OLD key's signature.
+type keyRotatePayload struct {
+	Pub []byte `json:"pub"`
+}
+
+// RotateKey transitions the timeline to a new signing key. The transition
+// itself is a chain event signed by the current key, so verifiers switch
+// keys exactly where the chain says so (a fork after recovery/re-key
+// verifies its full length, old prefix under the old key, new suffix under
+// the new one).
+func (t *Timeline) RotateKey(newKey ed25519.PrivateKey, ts int64) ([]byte, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.key == nil {
+		return nil, fmt.Errorf("timeline: read-only (loaded from file)")
+	}
+	p, err := json.Marshal(keyRotatePayload{Pub: newKey.Public().(ed25519.PublicKey)})
+	if err != nil {
+		return nil, err
+	}
+	h, err := t.append(EvKeyRotate, p, ts)
+	if err != nil {
+		return nil, err
+	}
+	t.rotations = append(t.rotations, rotKey{at: len(t.events) - 1, key: t.key})
+	t.key = newKey
+	t.pub = newKey.Public().(ed25519.PublicKey)
+	return h, nil
+}
+
+// walkVerify checks events[0..n): hashes, parent links, and signatures,
+// following KEY_ROTATE events (signed by the outgoing key) and EV_RECOVERY
+// events (FROST-authorized handoff) to switch the verification key
+// mid-chain. Returns the first bad index, or -1. A rotation event that
+// can't be parsed is treated as a chain break (it was signed by the old
+// key, so a malformed rotation is deliberate).
+func walkVerify(events []TrustEvent, startPub ed25519.PublicKey, councilPub ed25519.PublicKey, n int) int {
+	pub := startPub
+	for i := 0; i < n; i++ {
+		e := events[i]
+		if i == 0 && e.ParentHash != nil {
+			return i
+		}
+		if i > 0 && !bytes.Equal(e.ParentHash, events[i-1].Hash()) {
+			return i
+		}
+		if e.Type == EvRecovery {
+			if len(councilPub) != ed25519.PublicKeySize {
+				return i // no trust anchor: recovery handoffs are rejected
+			}
+			var fc FrostCommit
+			if json.Unmarshal(e.Payload, &fc) != nil || !fc.Valid(councilPub, 1) {
+				return i
+			}
+			// the handoff must reference the exact chain head before it
+			var want []byte
+			if i > 0 {
+				want = events[i-1].Hash()
+			}
+			if !bytes.Equal(fc.Checkpoint, want) {
+				return i
+			}
+			pub = fc.NewPub
+		}
+		if !ed25519.Verify(pub, e.canonical(), e.Signature) {
+			return i
+		}
+		if e.Type == EvKeyRotate {
+			var p keyRotatePayload
+			if json.Unmarshal(e.Payload, &p) != nil || len(p.Pub) != ed25519.PublicKeySize {
+				return i
+			}
+			pub = ed25519.PublicKey(p.Pub)
+		}
+	}
+	return -1
 }
 
 // Verify re-hashes the chain and re-checks every signature (FR1.2).
@@ -112,19 +268,7 @@ func (t *Timeline) VerifyPrefix(n int) bool {
 	if n > len(t.events) {
 		n = len(t.events)
 	}
-	for i := 0; i < n; i++ {
-		e := t.events[i]
-		if i == 0 && e.ParentHash != nil {
-			return false
-		}
-		if i > 0 && !bytes.Equal(e.ParentHash, t.events[i-1].Hash()) {
-			return false
-		}
-		if !ed25519.Verify(t.pub, e.canonical(), e.Signature) {
-			return false
-		}
-	}
-	return true
+	return walkVerify(t.events, t.startPub(), t.councilPub, n) == -1
 }
 
 // LocateBadEvent returns the index of the first event that breaks the chain
@@ -136,18 +280,30 @@ func (t *Timeline) LocateBadEvent() int {
 }
 
 func (t *Timeline) locateBadEvent() int {
-	for i, e := range t.events {
-		if i == 0 && e.ParentHash != nil {
-			return i
-		}
-		if i > 0 && !bytes.Equal(e.ParentHash, t.events[i-1].Hash()) {
-			return i
-		}
-		if !ed25519.Verify(t.pub, e.canonical(), e.Signature) {
-			return i
+	return walkVerify(t.events, t.startPub(), t.councilPub, len(t.events))
+}
+
+// pubForPrefix returns the verification key current after events[0..idx]
+// (the start key is replaced by any rotations/recoveries in the prefix;
+// the prefix is verified before Fork, so parsing the handoff is enough).
+func pubForPrefix(events []TrustEvent, startPub ed25519.PublicKey, idx int) ed25519.PublicKey {
+	pub := startPub
+	for i := 0; i <= idx; i++ {
+		e := events[i]
+		switch e.Type {
+		case EvKeyRotate:
+			var p keyRotatePayload
+			if json.Unmarshal(e.Payload, &p) == nil && len(p.Pub) == ed25519.PublicKeySize {
+				pub = ed25519.PublicKey(p.Pub)
+			}
+		case EvRecovery:
+			var fc FrostCommit
+			if json.Unmarshal(e.Payload, &fc) == nil && len(fc.NewPub) == ed25519.PublicKeySize {
+				pub = ed25519.PublicKey(fc.NewPub)
+			}
 		}
 	}
-	return -1
+	return pub
 }
 
 // Fork branches at the verified checkpoint hash. The original chain is
@@ -165,9 +321,31 @@ func (t *Timeline) Fork(atHash []byte) (*Timeline, error) {
 	if idx < 0 {
 		return nil, fmt.Errorf("checkpoint %x not in timeline", atHash)
 	}
-	f := &Timeline{key: t.key, pub: t.pub}
+	f := &Timeline{key: t.keyAt(idx), start: pubForPrefix(t.events, t.startPub(), idx),
+		councilPub: t.councilPub}
+	f.pub = f.start
 	f.events = append(f.events, t.events[:idx+1]...)
 	return f, nil
+}
+
+// keyAt is the signing key current at event idx (nil when unknown): the
+// first rotation at-or-after idx holds the key signed up to and including
+// that rotation event; past the last rotation, the live key applies.
+func (t *Timeline) keyAt(idx int) ed25519.PrivateKey {
+	for _, r := range t.rotations {
+		if r.at >= idx {
+			return r.key
+		}
+	}
+	return t.key
+}
+
+// startPub is the verification key that signed event[0].
+func (t *Timeline) startPub() ed25519.PublicKey {
+	if t.start != nil {
+		return t.start
+	}
+	return t.pub
 }
 
 // State is the derived trust state; fold is a pure, deterministic re-fold
@@ -179,9 +357,11 @@ type State struct {
 // timelineFile is the on-disk form of a timeline (operator handoff,
 // auditor mirror dumps, recovery evidence).
 type timelineFile struct {
-	Events []TrustEvent       `json:"events"`
-	Pub    ed25519.PublicKey  `json:"public_key"`
-	Key    ed25519.PrivateKey `json:"key,omitempty"` // demo/evidence only; production dumps omit it
+	Events     []TrustEvent       `json:"events"`
+	Pub        ed25519.PublicKey  `json:"public_key"`
+	StartPub   ed25519.PublicKey  `json:"start_pub,omitempty"` // key at event[0]; missing = Pub
+	CouncilPub ed25519.PublicKey  `json:"council_pub,omitempty"`
+	Key        ed25519.PrivateKey `json:"key,omitempty"` // demo/evidence only; production dumps omit it
 }
 
 // Save persists the timeline (events + verification key). The signing key
@@ -200,6 +380,12 @@ func (t *Timeline) Marshal(includeKey bool) ([]byte, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	f := timelineFile{Events: t.events, Pub: t.pub}
+	if t.start != nil {
+		f.StartPub = t.start
+	}
+	if t.councilPub != nil {
+		f.CouncilPub = t.councilPub
+	}
 	if includeKey && t.key != nil {
 		f.Key = t.key
 	}
@@ -226,10 +412,26 @@ func UnmarshalTimeline(b []byte) (*Timeline, error) {
 	if len(f.Pub) != ed25519.PublicKeySize {
 		return nil, fmt.Errorf("timeline: bad public key length %d", len(f.Pub))
 	}
+	if len(f.StartPub) != 0 && len(f.StartPub) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("timeline: bad start public key length %d", len(f.StartPub))
+	}
 	if len(f.Key) != 0 && len(f.Key) != ed25519.PrivateKeySize {
 		return nil, fmt.Errorf("timeline: bad private key length %d", len(f.Key))
 	}
-	return &Timeline{events: f.Events, pub: f.Pub, key: f.Key}, nil
+	if len(f.CouncilPub) != 0 && len(f.CouncilPub) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("timeline: bad council pub length %d", len(f.CouncilPub))
+	}
+	var start ed25519.PublicKey
+	if len(f.StartPub) == ed25519.PublicKeySize {
+		start = f.StartPub
+	} else {
+		start = f.Pub
+	}
+	var council ed25519.PublicKey
+	if len(f.CouncilPub) == ed25519.PublicKeySize {
+		council = f.CouncilPub
+	}
+	return &Timeline{events: f.Events, pub: f.Pub, start: start, councilPub: council, key: f.Key}, nil
 }
 
 type Cert struct {

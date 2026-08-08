@@ -7,7 +7,7 @@ DOCKER   := docker
 GOOS_    := linux
 GOARCH_  := amd64
 
-.PHONY: all build build-linux test benchmark kill-tests model-check model-check-mutations fleet-smoke docker-build clean
+.PHONY: all build build-linux test benchmark kill-tests model-check model-check-mutations fleet-smoke docker-build helm-lint terraform-validate clean
 
 all: build
 
@@ -49,6 +49,16 @@ fleet-smoke:
 # verified as linux ELFs by build-linux and CI.
 docker-build:
 	$(DOCKER) build -t trust-orchestrator:latest .
+
+# helm-lint: validate the chart (requires helm).
+helm-lint:
+	helm lint helm/trust-orchestrator
+
+# terraform-validate: check all three cloud modules (requires terraform).
+terraform-validate:
+	cd terraform/aws && terraform fmt -check -recursive && terraform validate
+	cd terraform/azure && terraform fmt -check -recursive && terraform validate
+	cd terraform/gcp && terraform fmt -check -recursive && terraform validate
 
 test:
 	$(GO) test ./...

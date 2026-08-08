@@ -9,7 +9,7 @@ What this system uses and — critically — what is **real** vs what is
 |---|---|---|
 | **Ed25519** signatures | every trust event, bootstrap cert, workload cert | `TestChainAppendVerify`, `TestVerifyRejectsTampering` |
 | **SHA-256** | Merkle chain + hash path for `Timeline.Hash()` | `TestFoldDeterministic` |
-| **Shamir Scheme (3-of-5)** | split/reconstruct the recovery key | `TestShamirRoundtrip`, `TestShamirWrongShard` |
+| **FROST (3-of-5, two-round)** | council threshold-signs the epoch handoff; the root key never exists | `TestEpochCommitValidity`, `TestFrostSelfCheck` |
 | **TLS 1.3 mutual** | watchdog↔orchestrator & identity consumer wire | `TestMutualTLSRequest`, `TestWireRealSockets` |
 | **X.509** | workload cert CA (`IssueWorkloadCert`) | `TestIdentityIssueAndVerify` |
 
@@ -25,12 +25,15 @@ All built on **Go stdlib only** — `crypto/ed25519`, `crypto/sha256`,
 - **Quorum fusion**: `DETECTED = #{low scores} ≥ 3` with n=5 (Byzantine
   assumption f=1, n≥3f+1).
 
-## Shamir properties we rely on
+## FROST properties we rely on
 
-- Key split into 5 shares, threshold 3 → any 3 reconstruct, any 1–2 gives
-  nothing (verified by wrong/too-few share tests).
-- After reconstruction, `zeroize()` upstream clears working memory (memory-
-  only step, FR3.3 — semantic, not a hardware enclave).
+- FROST: the seed's public key IS the group key — shares sign exactly what
+  the seed would sign (`FrostSplit`), so threshold recovery is verifiable
+  against a public anchor the gateway holds.
+- Key split into 5 shares, threshold 3 → any 3 sign, any 1–2 gives nothing
+  (verified by wrong/too-few share tests); after a ceremony the root never
+  exists, and `zeroize()` clears working state (memory-only step, FR3.3 —
+  semantic, not a hardware enclave).
 
 ## Mutual TLS detail
 

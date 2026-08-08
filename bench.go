@@ -1,6 +1,7 @@
 package trustorchestrator
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
@@ -100,12 +101,25 @@ func (b *Bench) watchdogsH(tl *Timeline, log *AuditorLog, h1 float64) []*Watchdo
 	}
 }
 
-func (b *Bench) council(key ed25519.PrivateKey) *Council {
-	shards, _ := ShamirSplit(key.Seed(), 5, 3)
-	members := make([]*CouncilMember, 5)
-	for i := range members {
-		_, k, _ := ed25519.GenerateKey(rand.Reader)
-		members[i] = &CouncilMember{ID: fmt.Sprintf("C%d", i+1), Key: k, Shard: shards[i]}
+// council is a fresh FROST council of 5 members (quorum 3). The org root
+// key is irrelevant to the council: shares come from the DKG ceremony, not
+// from sharding the root (the root never exists).
+func (b *Bench) council() *Council {
+	return b.councilN(5, quorum)
+}
+
+// councilN returns a council holding the first n shares of a fresh ceremony.
+func (b *Bench) councilN(n, t int) *Council {
+	signers, _, err := DkgCeremony(5, t)
+	if err != nil {
+		panic(err)
+	}
+	members := make([]*CouncilMember, 0, n)
+	for i, sg := range signers {
+		if i >= n {
+			break
+		}
+		members = append(members, &CouncilMember{ID: sg.ID, Share: sg})
 	}
 	return NewCouncil(members)
 }
@@ -174,9 +188,9 @@ func (b *Bench) detectedEvidence(tl *Timeline, badIdx int, ts int64) *TrustEvent
 }
 
 // recover runs the council over a DETECTED evidence event.
-func (b *Bench) recover(key ed25519.PrivateKey, tl *Timeline, ev *TrustEvent) (*RecoveryReport, time.Duration, error) {
+func (b *Bench) recover(tl *Timeline, ev *TrustEvent) (*RecoveryReport, time.Duration, error) {
 	start := time.Now()
-	rep, err := b.council(key).Recover(tl, ev, quorum)
+	rep, err := b.council().Recover(tl, ev, quorum)
 	return rep, time.Since(start), err
 }
 
@@ -225,7 +239,7 @@ func (b *Bench) s1H(h1 float64) (Metrics, *Timeline, int) {
 		return m, tl, badIdx
 	}
 	m.DetectionLatency = time.Duration(detectCycle-normal) * b.cycle
-	rep, rto, err := b.recover(key, tl, b.detectedEvidence(tl, badIdx, int64(detectCycle)))
+	rep, rto, err := b.recover(tl, b.detectedEvidence(tl, badIdx, int64(detectCycle)))
 	m.RecoveryTime = rto
 	m.RollbackCorrect = err == nil && rep.Verify.Pass()
 	return m, tl, badIdx
@@ -274,7 +288,7 @@ func (b *Bench) ScenarioS2() Metrics {
 	if !m.Detected {
 		return m
 	}
-	rep, rto, err := b.recover(key, tl, b.detectedEvidence(tl, 20, int64(len(batches))))
+	rep, rto, err := b.recover(tl, b.detectedEvidence(tl, 20, int64(len(batches))))
 	m.RecoveryTime = rto
 	m.RollbackCorrect = err == nil && rep.Verify.Pass()
 	return m
@@ -309,17 +323,25 @@ func (b *Bench) ScenarioS4() Metrics {
 		tl.Append(EvIssue, issue(fmt.Sprintf("c%d", i), "user", "", int64(i)), int64(i))
 		log.Mirror(tl.events[len(tl.events)-1])
 	}
-	shards, _ := ShamirSplit(key.Seed(), 5, 3)
+	// mk builds a fresh council from a fresh ceremony each call: shares are
+	// single-use (one Commit per signer), so the blocked attempt must not
+	// consume the shares of the successful one.
 	mk := func(ids ...int) *Council {
+		signers, _, err := DkgCeremony(5, quorum)
+		if err != nil {
+			return nil
+		}
 		members := make([]*CouncilMember, 0, len(ids))
 		for _, i := range ids {
-			_, k, _ := ed25519.GenerateKey(rand.Reader)
-			members = append(members, &CouncilMember{ID: fmt.Sprintf("C%d", i+1), Key: k, Shard: shards[i]})
+			members = append(members, &CouncilMember{ID: signers[i].ID, Share: signers[i]})
 		}
 		return NewCouncil(members)
 	}
 	ev := b.detectedEvidence(tl, 0, 100)
-	if _, err := mk(0, 1).Recover(tl, ev, quorum); err == nil {
+	if c := mk(0, 1); c == nil {
+		m.FalsePositive = true
+		return m
+	} else if _, err := c.Recover(tl, ev, quorum); err == nil {
 		m.FalsePositive = true // 2 members must NOT recover (P2)
 		return m
 	}
@@ -338,33 +360,47 @@ func (b *Bench) recoverWith(c *Council, tl *Timeline, ev *TrustEvent) (*Recovery
 
 // ScenarioS5: attacker attempts competing recovery entries (fork race, A5).
 // Canonical = highest *valid* epoch; forged or gapped chains lose (FR4.4).
+// Each SignCommit needs a fresh council: signer shares are single-use
+// (one nonce commitment per message — the wire protocol's replay guard).
 func (b *Bench) ScenarioS5() Metrics {
 	m := Metrics{Scenario: "S5_fork_race"}
-	_, key, _ := ed25519.GenerateKey(rand.Reader)
-	c := b.council(key)
-	pubs := c.Pubs()
-	honest := []*EpochCommit{}
-	for i := int64(1); i <= 3; i++ {
-		ec, ok := c.SignCommit(i, []byte{byte(i)}, i-1, nil, quorum, "C1", "C2", "C3")
+	honest := []*FrostCommit{}
+	council := b.council()
+	groupPub := council.GroupPub()
+	for e := int64(1); e <= 3; e++ {
+		// one ceremony, many epochs: members draw fresh nonces per epoch
+		// (Commit is single-use per message, like a restart between epochs)
+		for _, m := range council.shareHolders() {
+			m.Share.used = false
+			m.Share.d, m.Share.e = nil, nil
+		}
+		fc, ok := council.SignCommit(e, []byte{byte(e)}, e-1, bytes.Repeat([]byte{0xaa}, 32), []byte("handoff"), quorum, council.memberIDs()...)
 		if !ok {
 			return m
 		}
-		honest = append(honest, ec)
+		honest = append(honest, fc)
 	}
-	forged := []*EpochCommit{} // attacker signs with a key no member trusts
+	// Forged: a chain signed by a key no member's shares form.
+	forged := []*FrostCommit{}
 	_, ak, _ := ed25519.GenerateKey(rand.Reader)
 	for i := int64(1); i <= 50; i++ {
-		forged = append(forged, &EpochCommit{Epoch: i, RootHash: []byte{0xaa}, Prev: i - 1, Sigs: map[string][]byte{"X": ed25519.Sign(ak, []byte(fmt.Sprintf("e%d", i)))}})
+		forged = append(forged, &FrostCommit{Epoch: i, Checkpoint: []byte{0xaa}, Prev: i - 1,
+			NewPub: []byte{0xbb}, Payload: []byte("x"),
+			Sig: ed25519.Sign(ak, []byte(fmt.Sprintf("e%d", i))), Members: []string{"X"}})
 	}
-	gapped := []*EpochCommit{} // honest signatures but epoch 3 missing
-	for _, e := range []int64{1, 2, 4} {
-		ec, ok := c.SignCommit(e, []byte{byte(e)}, e-1, nil, quorum, "C1", "C2", "C3")
+	gapped := []*FrostCommit{} // honest signatures but epoch 3 missing
+	for _, e := range []int64{1, 2} {
+		for _, m := range council.shareHolders() {
+			m.Share.used = false
+			m.Share.d, m.Share.e = nil, nil
+		}
+		fc, ok := council.SignCommit(e, []byte{byte(e)}, e-1, bytes.Repeat([]byte{0xaa}, 32), []byte("handoff"), quorum, council.memberIDs()...)
 		if !ok {
 			break
 		}
-		gapped = append(gapped, ec)
+		gapped = append(gapped, fc)
 	}
-	best, _ := HighestValidEpoch([][]*EpochCommit{honest, forged, gapped}, pubs, quorum)
+	best, _ := HighestValidEpoch([][]*FrostCommit{honest, forged, gapped}, groupPub, quorum)
 	m.CanonicalHighest = len(best) == len(honest) && best[len(best)-1].Epoch == 3
 	return m
 }
@@ -417,17 +453,14 @@ func (b *Bench) ScenarioS6() Metrics {
 	}
 	m.DetectionLatency = time.Duration(detectCycle-5) * b.cycle
 	ev := b.detectedEvidence(tl, 3, int64(detectCycle))
-	shards, _ := ShamirSplit(key.Seed(), 5, 3)
-	part := make([]*CouncilMember, 2)
-	for i := range part {
-		_, k, _ := ed25519.GenerateKey(rand.Reader)
-		part[i] = &CouncilMember{ID: fmt.Sprintf("C%d", i+1), Key: k, Shard: shards[i]}
-	}
-	if _, err := NewCouncil(part).Recover(tl, ev, quorum); err == nil {
+	if part := b.councilN(2, quorum); part == nil {
+		m.FalsePositive = true
+		return m
+	} else if _, err := part.Recover(tl, ev, quorum); err == nil {
 		m.FalsePositive = true // partition must block (P2)
 		return m
 	}
-	rep, rto, err := b.recover(key, tl, ev)
+	rep, rto, err := b.recover(tl, ev)
 	m.RecoveryTime = rto
 	m.RollbackCorrect = err == nil && rep.Verify.Pass()
 	return m
@@ -518,7 +551,7 @@ func (b *Bench) ScenarioWorkloadReissue() Metrics {
 	detectIdx := 180
 	ev := b.detectedEvidence(tl, detectIdx, 400)
 	start := time.Now()
-	rep, err := b.council(key).Recover(tl, ev, quorum)
+	rep, err := b.council().Recover(tl, ev, quorum)
 	m.WorkloadTime = time.Since(start)
 	if err != nil || !rep.Verify.Pass() {
 		return m

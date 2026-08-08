@@ -1,0 +1,61 @@
+# Trust Orchestrator chart values.
+# Bootstrap ceremony BEFORE installing (nothing is hardcoded here either):
+#   1. offline:  to-tool genkey root.key && to-tool shard --key root.key --shares 5 --threshold 3
+#   2. CA + node certs:  to-identity ca --key root.key --out ca.der
+#      to-identity issue --ca ca.der --key root.key --identity <C1..C5|orchestrator|watchdog> --serial N --out <node>.der --key-out <node>.key
+#   3. export timeline:  to-orchestrator timeline > timeline.json
+#   4. fill secrets.* below with that material, then helm install.
+
+image:
+  repository: trust-orchestrator
+  tag: latest
+  pullPolicy: IfNotPresent
+
+namespace:
+  name: trust-orchestrator
+  create: true
+
+gateway:
+  replicas: 1
+  adminToken: ""            # empty = printed on first boot; set for unattended installs
+  storage: 1Gi
+  service:
+    type: ClusterIP
+    port: 8080
+  ingress:
+    enabled: false          # terminate TLS at the ingress; bearer-token auth inside
+    className: nginx
+    host: to.example.com
+
+orchestrator:
+  replicas: 1
+  storage: 1Gi
+
+# One entry per council member. Shard files from `to-tool shard` (step 1);
+# nodeKey/leaf from `to-identity issue --key-out` (step 2). Each member's
+# shard lives in its own Secret — never shared.
+council:
+  members: []
+  # members:
+  #   - id: C1
+  #     shard: '{"x":1,"y":1,"len":32}'
+  #     nodeKey: "0000...  (hex)"
+  #     leaf: "MIIB...  (base64 DER)"
+  #   - id: C2 ...
+
+watchdog:
+  replicas: 5
+  kind: behavior_baseline     # any of: rate_cusum|log_integrity|graph_anomaly|external_probe|behavior_baseline
+  params: '{"w1":{"mu0":1,"delta":1,"h":3},"w3":{"mu0":0.5,"delta":0.5,"h":3},"w5":{"mu0":1,"delta":0.5,"h":2}}'
+  timeline: '{"events":[],"public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}'  # from step 3
+
+secrets:
+  identityCa:                # shared mTLS CA (ca.der verifies every peer)
+    caKey: ""                # hex; kept for completeness, never mounted
+    caDer: ""                # base64 DER
+  orchestratorNode:
+    nodeKey: ""              # hex
+    leaf: ""                 # base64 DER
+  watchdogNode:
+    nodeKey: ""              # hex
+    leaf: ""                 # base64 DER

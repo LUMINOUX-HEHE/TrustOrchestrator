@@ -1,0 +1,84 @@
+# Trust Orchestrator — GitLab CI (mirror of .github/workflows/ci.yml)
+# Stages: test -> benchmark -> model-check. Same gates as the GitHub CI.
+
+stages:
+  - test
+  - benchmark
+  - model-check
+
+variables:
+  GO_VERSION: "1.22"
+  GOFLAGS: "-mod=mod"
+
+.test: &test
+  image: golang:${GO_VERSION}
+  cache:
+    key: go-mod
+    paths:
+      - go/pkg/mod/
+
+vet:
+  <<: *test
+  stage: test
+  script:
+    - go vet ./...
+
+unit-tests:
+  <<: *test
+  stage: test
+  script:
+    - go test ./...
+
+kill-tests:
+  <<: *test
+  stage: test
+  script:
+    - go test ./... -run '^TestK' -v
+
+fuzz-shamir:
+  <<: *test
+  stage: test
+  script:
+    - go test . -run '^$' -fuzz '^FuzzShamirRoundTrip$' -fuzztime 30s
+
+fuzz-timeline:
+  <<: *test
+  stage: test
+  script:
+    - go test . -run '^$' -fuzz '^FuzzUnmarshalTimeline$' -fuzztime 30s
+
+fuzz-wire:
+  <<: *test
+  stage: test
+  script:
+    - go test . -run '^$' -fuzz '^FuzzWireFrame$' -fuzztime 30s
+
+cross-build:
+  <<: *test
+  stage: test
+  script:
+    - GOOS=linux GOARCH=amd64 go build ./...
+
+benchmark:
+  <<: *test
+  stage: benchmark
+  script:
+    - go run ./cmd/to bench run --scenario all --out reports --log reports/action-log.txt | tee bench.log
+    - go run ./cmd/to bench calibrate --out reports
+    - '! grep -q "WARNING" bench.log'   # evidence must match the calibrated operating point
+  artifacts:
+    paths:
+      - reports/
+    expire_in: 30 days
+
+model-check:
+  image: eclipse-temurin:21
+  stage: model-check
+  script:
+    - cd specs
+    - java -jar ../tools/tla2tools.jar -workers 2 -config TrustOrchestratorCI.cfg TrustOrchestrator.tla | tee ../reports/tlc-ci.log
+    - grep -q "No error has been found" ../reports/tlc-ci.log
+  artifacts:
+    paths:
+      - reports/tlc-ci.log
+    expire_in: 30 days
