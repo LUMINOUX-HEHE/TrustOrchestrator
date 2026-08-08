@@ -64,6 +64,9 @@ single machine deciding anything alone.
 - `docs/00-overview.md` … `docs/09-limitations.md` — self-contained reference
   (overview, architecture, requirements trace, component map, threat model,
   cryptography, workflow, testing, deployment, honest limitations)
+- `research/` — TrustFabric: the multi-layer research program on top of this
+  engine (executive summary, full system architecture, one spec per layer
+  L1–L5, roadmap)
 - `deploy/` — systemd units, `fleet-smoke.sh` live-fleet proof, `kubernetes.yaml`
 - `helm/trust-orchestrator/` — Helm chart (orchestrator, council, watchdogs,
   gateway, secrets, network policies) for `deploy/kubernetes.yaml` workloads
